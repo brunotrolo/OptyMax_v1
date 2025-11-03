@@ -1,0 +1,1 @@
+<conteúdo atualizado do app.py com integração OPLAB>
