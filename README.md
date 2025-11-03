@@ -1,40 +1,19 @@
-# OptyMax MVP — Streamlit + OPLAB API
+# OptyMax — MVP corrigido (requisitos do usuário)
 
-Este projeto é um MVP em Streamlit que integra com a API pública da OPLAB (v3) para buscar dados de opções, calcular métricas e sugerir estratégias de venda coberta e strangle vendido coberto.
+Este pacote contém a versão do MVP atualizada para cumprir os requisitos descritos pelo usuário.
 
-## 🚀 Execução Local
+## Principais cuidados
+- Defina a variável de ambiente `OPLAB_TOKEN` com seu Access-Token. Ex:
+  - `export OPLAB_TOKEN='SEU_TOKEN'`
+- O app tenta buscar tickers em https://www.dadosdemercado.com.br/acoes e usar endpoints da OPLAB v3.
+- Se a OPLAB não liberar a listagem da cadeia por ticker, o app usará um fallback sintético.
+- Para calcular IV Rank e Beta, o app usa `yfinance`. Instale dependência e garanta acesso à internet.
 
-```bash
+## Rodar localmente
+```
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+export OPLAB_TOKEN='SEU_TOKEN'
 streamlit run app.py
 ```
-
-## 🔑 Configuração do Token OPLAB
-
-O token de acesso deve ser configurado como variável de ambiente:
-
-**Linux/Mac**
-```bash
-export OPLAB_TOKEN='seu_token_aqui'
-```
-
-**Windows (PowerShell)**
-```powershell
-$env:OPLAB_TOKEN='seu_token_aqui'
-```
-
-## 🧩 Principais Endpoints Utilizados
-
-- `/v3/market/options/details/{symbol}` — Consulta de detalhes da opção
-- `/v3/market/options/bs` — Cálculo Black-Scholes (Delta, Gamma, Vega, etc.)
-
-## 📈 Funcionalidades
-
-- Consulta dinâmica de opções CALL e PUT
-- Cálculo de métricas (TIO, Delta, IV proxy)
-- Sugestão de Strangles vendidas cobertas
-- Exportação CSV dos resultados
-
-## ☁️ Deploy
-
-Pode ser hospedado gratuitamente em [Streamlit Cloud](https://streamlit.io/cloud) ou em qualquer ambiente Python com acesso à internet.
