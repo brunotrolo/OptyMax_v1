@@ -1,16 +1,16 @@
 # app.py
 """
-OptyMax — MVP Final (2 Etapas + Tracking + Campo CLOSE)
--------------------------------------------------------
-- Etapa 1: Lista opções da OPLAB com campo CLOSE (último preço)
-- Etapa 2: Processa recomendações usando CLOSE como preço base
-- Barra de progresso e log detalhado em tempo real
-- Integração direta com API OPLAB v3
+OptyMax — MVP Final (Filtro DTM Corrigido + CLOSE + 2 Etapas)
+-------------------------------------------------------------
+- Etapa 1: Lista opções da OPLAB com filtro DTM aplicado antes da exibição
+- Etapa 2: Processa recomendações com DTM e Delta respeitados
+- Tracking em tempo real + logs
+- Base de cálculo = CLOSE (último preço)
 """
 
 import os
 import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date
 import pandas as pd
 import numpy as np
 import requests
@@ -31,7 +31,7 @@ except Exception:
     HAVE_YFINANCE = False
 
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (CLOSE + Tracking Tempo Real)")
+st.title("📈 OptyMax — Venda Coberta e Strangle (Filtro DTM + CLOSE + Tracking Tempo Real)")
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -61,14 +61,6 @@ def fetch_tickers_with_names():
     except Exception:
         return [("PETR4", "Petrobras PN"), ("VALE3", "Vale ON"),
                 ("ITUB4", "Itaú Unibanco PN"), ("BBDC4", "Bradesco PN"), ("ABEV3", "Ambev ON")]
-
-
-def days_to_maturity_from_date(due_str: str):
-    try:
-        dt = datetime.fromisoformat(due_str.split("T")[0]).date()
-        return max((dt - date.today()).days, 0)
-    except Exception:
-        return 0
 
 
 def fetch_options_chain_by_parent(parent: str, log_box):
@@ -143,6 +135,7 @@ def compute_iv_rank(symbol: str, iv_today: float):
     except Exception:
         return None
 
+
 # ============================================================
 # INTERFACE DO USUÁRIO
 # ============================================================
@@ -179,10 +172,18 @@ if listar and sel:
     for i, tk in enumerate(selected_tickers, start=1):
         progress_text.markdown(f"📊 **Listando opções de `{tk}` ({i}/{total})**")
         df = fetch_options_chain_by_parent(tk, log_box)
+
         if not df.empty:
-            st.session_state["opcoes"][tk] = df
-            st.subheader(f"📈 {tk} — Opções disponíveis ({len(df)})")
-            st.dataframe(df[["option_symbol", "type", "strike", "bid", "ask", "close", "expiration", "dtm", "spot"]])
+            df["dtm"] = pd.to_numeric(df["dtm"], errors="coerce").fillna(0).astype(int)
+            df = df[(df["dtm"] >= dtm_min) & (df["dtm"] <= dtm_max)]
+
+            if df.empty:
+                st.warning(f"⚠️ Nenhuma opção dentro do intervalo {dtm_min}-{dtm_max} dias para {tk}.")
+            else:
+                st.session_state["opcoes"][tk] = df
+                st.subheader(f"📈 {tk} — Opções ({len(df)}) dentro do DTM definido")
+                st.dataframe(df[["option_symbol", "type", "strike", "bid", "ask", "close", "expiration", "dtm", "spot"]])
+
         progress_bar.progress(i / total)
 
     progress_text.markdown("✅ **Listagem concluída!**")
@@ -206,6 +207,9 @@ if processar:
 
         for i, tk in enumerate(tickers_listados, start=1):
             df_chain = st.session_state["opcoes"][tk]
+            df_chain["dtm"] = pd.to_numeric(df_chain["dtm"], errors="coerce").fillna(0).astype(int)
+            df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
+
             progress_text.markdown(f"⚙️ **Processando `{tk}` ({i}/{total})**")
             log_box.text(f"[{tk}] Calculando Black-Scholes e aplicando filtros...")
 
@@ -218,7 +222,7 @@ if processar:
                         "type": row["type"],
                         "spotprice": row["spot"],
                         "strike": row["strike"],
-                        "premium": row["close"],  # 🔹 Usando CLOSE como base
+                        "premium": row["close"],
                         "dtm": row["dtm"],
                         "vol": 0.3,
                         "duedate": row["expiration"],
@@ -231,9 +235,7 @@ if processar:
                     continue
                 time.sleep(0.02)
 
-            # Filtragem
             df_chain["delta_abs"] = df_chain["delta"].abs()
-            df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
             df_chain = df_chain[(df_chain["delta_abs"] >= delta_min) & (df_chain["delta_abs"] <= delta_max)]
 
             if HAVE_YFINANCE:
