@@ -1,11 +1,11 @@
 # app.py
 """
-OptyMax — MVP Final (2 Etapas: Listagem + Processamento)
+OptyMax — MVP Final (2 Etapas + Tracking + Campo CLOSE)
 -------------------------------------------------------
-- Etapa 1: Listar opções (consulta leve à API OPLAB)
-- Etapa 2: Processar recomendações (cálculos de Delta, IV Rank e TIO)
-- Tracking em tempo real com barra de progresso
-- Integração direta com a API OPLAB v3
+- Etapa 1: Lista opções da OPLAB com campo CLOSE (último preço)
+- Etapa 2: Processa recomendações usando CLOSE como preço base
+- Barra de progresso e log detalhado em tempo real
+- Integração direta com API OPLAB v3
 """
 
 import os
@@ -31,7 +31,7 @@ except Exception:
     HAVE_YFINANCE = False
 
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (2 Etapas + Tracking Tempo Real)")
+st.title("📈 OptyMax — Venda Coberta e Strangle (CLOSE + Tracking Tempo Real)")
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -89,6 +89,7 @@ def fetch_options_chain_by_parent(parent: str, log_box):
                         "expiration": it.get("due_date"),
                         "bid": float(it.get("bid") or 0),
                         "ask": float(it.get("ask") or 0),
+                        "close": float(it.get("close") or 0),
                         "spot": float(it.get("spot_price") or 0),
                         "dtm": int(it.get("days_to_maturity") or 0),
                         "open_interest": int(it.get("open_interest") or 0),
@@ -161,7 +162,6 @@ iv_rank_min = st.sidebar.number_input("IV Rank mínimo (%)", 0.0, 100.0, 0.0, st
 listar = st.sidebar.button("📋 Listar Opções")
 processar = st.sidebar.button("⚙️ Gerar Recomendações")
 
-# Inicializar session state
 if "opcoes" not in st.session_state:
     st.session_state["opcoes"] = {}
 
@@ -182,7 +182,7 @@ if listar and sel:
         if not df.empty:
             st.session_state["opcoes"][tk] = df
             st.subheader(f"📈 {tk} — Opções disponíveis ({len(df)})")
-            st.dataframe(df[["option_symbol", "type", "strike", "bid", "ask", "expiration", "dtm", "spot"]])
+            st.dataframe(df[["option_symbol", "type", "strike", "bid", "ask", "close", "expiration", "dtm", "spot"]])
         progress_bar.progress(i / total)
 
     progress_text.markdown("✅ **Listagem concluída!**")
@@ -218,7 +218,7 @@ if processar:
                         "type": row["type"],
                         "spotprice": row["spot"],
                         "strike": row["strike"],
-                        "premium": row["bid"],
+                        "premium": row["close"],  # 🔹 Usando CLOSE como base
                         "dtm": row["dtm"],
                         "vol": 0.3,
                         "duedate": row["expiration"],
@@ -241,8 +241,8 @@ if processar:
             else:
                 df_chain["iv_rank"] = None
 
-            calls = df_chain[df_chain["type"] == "CALL"].sort_values(by="bid", ascending=False).head(3)
-            puts = df_chain[df_chain["type"] == "PUT"].sort_values(by="bid", ascending=False).head(3)
+            calls = df_chain[df_chain["type"] == "CALL"].sort_values(by="close", ascending=False).head(3)
+            puts = df_chain[df_chain["type"] == "PUT"].sort_values(by="close", ascending=False).head(3)
 
             if not calls.empty:
                 calls["ticker"] = tk
@@ -253,7 +253,7 @@ if processar:
 
             if not calls.empty and not puts.empty:
                 best_call, best_put = calls.iloc[0], puts.iloc[0]
-                total_premium = best_call["bid"] + best_put["bid"]
+                total_premium = best_call["close"] + best_put["close"]
                 tio = compute_tio(total_premium, best_call["spot"], best_call["dtm"])
                 all_strangles.append({
                     "ticker": tk,
@@ -274,12 +274,12 @@ if processar:
         if all_calls:
             st.subheader("📈 CALLs Selecionadas")
             dfc = pd.concat(all_calls)
-            st.dataframe(dfc[["ticker", "option_symbol", "strike", "dtm", "bid", "delta", "iv", "iv_rank"]])
+            st.dataframe(dfc[["ticker", "option_symbol", "strike", "dtm", "close", "delta", "iv", "iv_rank"]])
 
         if all_puts:
             st.subheader("📉 PUTs Selecionadas")
             dfp = pd.concat(all_puts)
-            st.dataframe(dfp[["ticker", "option_symbol", "strike", "dtm", "bid", "delta", "iv", "iv_rank"]])
+            st.dataframe(dfp[["ticker", "option_symbol", "strike", "dtm", "close", "delta", "iv", "iv_rank"]])
 
         if all_strangles:
             st.subheader("🔁 Strangles Montados")
