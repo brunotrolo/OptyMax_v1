@@ -1,11 +1,11 @@
 # app.py
 """
-OptyMax — MVP Final com integração real com a API OPLAB v3
----------------------------------------------------------
-- Lista automática de tickers da B3 (com nome da empresa)
-- Busca real de opções com endpoint /market/options/{UNDERLYING}
+OptyMax — MVP Final com integração real com API OPLAB e tracking em tempo real
+-----------------------------------------------------------------------------
+- Busca real das opções via endpoint /market/options/{UNDERLYING}
+- Barra de progresso e log dinâmico de execução
 - Delta min/max aplicados a CALL e PUT
-- Cálculo de TIO e IV Rank
+- Cálculo de TIO e IV Rank (via yfinance)
 - Sem geração de dados sintéticos
 """
 
@@ -32,7 +32,7 @@ except Exception:
     HAVE_YFINANCE = False
 
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (OPLAB v3 Integrado)")
+st.title("📈 OptyMax — Venda Coberta e Strangle (OPLAB v3 + Tracking Tempo Real)")
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -72,10 +72,11 @@ def days_to_maturity_from_date(due_str: str):
         return 0
 
 
-def fetch_options_chain_by_parent(parent: str):
+def fetch_options_chain_by_parent(parent: str, log_box):
     """Obtém lista de opções de um ativo base diretamente da API OPLAB"""
     url = f"{OPLAB_BASE}/market/options/{parent}"
     try:
+        log_box.text(f"[{parent}] 🔍 Consultando opções na OPLAB...")
         r = requests.get(url, headers=HEADERS, timeout=10)
         if r.status_code == 200:
             data = r.json()
@@ -95,23 +96,26 @@ def fetch_options_chain_by_parent(parent: str):
                         "volume": int(it.get("volume") or 0),
                         "parent_symbol": parent
                     })
+                log_box.text(f"[{parent}] ✅ {len(rows)} opções carregadas da OPLAB.")
                 return pd.DataFrame(rows)
             else:
-                st.warning(f"Nenhum dado retornado para {parent}.")
+                log_box.text(f"[{parent}] ⚠️ Nenhum dado de opção retornado.")
+        else:
+            log_box.text(f"[{parent}] ❌ Erro HTTP {r.status_code}")
     except Exception as e:
-        st.error(f"Erro ao consultar API OPLAB para {parent}: {e}")
+        log_box.text(f"[{parent}] ❌ Erro ao consultar API OPLAB: {e}")
     return pd.DataFrame()
 
 
-def fetch_bs_oplab(params: dict):
+def fetch_bs_oplab(params: dict, log_box):
     """Consulta modelo Black-Scholes na OPLAB"""
     url = f"{OPLAB_BASE}/market/options/bs"
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=8)
         if r.status_code == 200:
             return r.json()
-    except Exception:
-        pass
+    except Exception as e:
+        log_box.text(f"Erro Black-Scholes: {e}")
     return {}
 
 
@@ -163,15 +167,24 @@ if run and sel:
     selected_tickers = [ticker_map[s] for s in sel]
     all_calls, all_puts, all_strangles = [], [], []
 
-    for tk in selected_tickers:
-        st.subheader(f"📊 Processando {tk}")
-        df_chain = fetch_options_chain_by_parent(tk)
+    progress_text = st.empty()
+    log_box = st.empty()
+    progress_bar = st.progress(0)
 
+    total = len(selected_tickers)
+    for i, tk in enumerate(selected_tickers, start=1):
+        progress_text.markdown(f"🚀 **Processando `{tk}` ({i}/{total})**")
+        log_box.text(f"[{tk}] Iniciando processamento...")
+
+        # 1️⃣ Buscar opções da OPLAB
+        df_chain = fetch_options_chain_by_parent(tk, log_box)
         if df_chain.empty:
-            st.warning(f"Nenhum dado encontrado para {tk}. Verifique o token OPLAB.")
+            st.warning(f"Nenhum dado retornado para {tk}. Verifique token OPLAB.")
+            progress_bar.progress(i / total)
             continue
 
-        # Consultar Black-Scholes para delta e IV
+        # 2️⃣ Consultar Black-Scholes
+        log_box.text(f"[{tk}] Calculando Greeks via Black-Scholes...")
         df_chain["delta"], df_chain["iv"] = np.nan, np.nan
         for idx, row in df_chain.iterrows():
             try:
@@ -187,25 +200,26 @@ if run and sel:
                     "duedate": row["expiration"],
                     "amount": LOT_SIZE,
                 }
-                bs = fetch_bs_oplab(params)
+                bs = fetch_bs_oplab(params, log_box)
                 df_chain.at[idx, "delta"] = bs.get("delta", np.nan)
                 df_chain.at[idx, "iv"] = bs.get("volatility", np.nan)
             except Exception:
                 continue
             time.sleep(0.02)
 
-        # Filtragem
+        # 3️⃣ Aplicar filtros
+        log_box.text(f"[{tk}] Aplicando filtros e selecionando melhores CALLs/PUTs...")
         df_chain["delta_abs"] = df_chain["delta"].abs()
         df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
         df_chain = df_chain[(df_chain["delta_abs"] >= delta_min) & (df_chain["delta_abs"] <= delta_max)]
 
-        # Calcular IV Rank
+        # 4️⃣ Calcular IV Rank
         if HAVE_YFINANCE:
             df_chain["iv_rank"] = df_chain["iv"].apply(lambda v: compute_iv_rank(tk, v) if pd.notna(v) else None)
         else:
             df_chain["iv_rank"] = None
 
-        # Top 3 CALLs e PUTs
+        # 5️⃣ Selecionar CALLs e PUTs
         calls = df_chain[df_chain["type"] == "CALL"].sort_values(by="bid", ascending=False).head(3)
         puts = df_chain[df_chain["type"] == "PUT"].sort_values(by="bid", ascending=False).head(3)
         if not calls.empty:
@@ -215,7 +229,7 @@ if run and sel:
             puts["ticker"] = tk
             all_puts.append(puts)
 
-        # Criar strangle simples
+        # 6️⃣ Montar Strangle
         if not calls.empty and not puts.empty:
             best_call, best_put = calls.iloc[0], puts.iloc[0]
             total_premium = best_call["bid"] + best_put["bid"]
@@ -229,7 +243,14 @@ if run and sel:
                 "dtm": best_call["dtm"],
                 "iv_rank": best_call.get("iv_rank", None)
             })
+        log_box.text(f"[{tk}] ✅ Finalizado.")
+        progress_bar.progress(i / total)
 
+    progress_text.markdown("✅ **Processamento concluído!**")
+    log_box.text("Todos os tickers foram processados com sucesso.")
+    progress_bar.empty()
+
+    # Exibir resultados finais
     if all_calls:
         st.subheader("📈 CALLs Selecionadas")
         dfc = pd.concat(all_calls)
