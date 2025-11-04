@@ -1,83 +1,96 @@
 #!/usr/bin/env python3
-# analysis_optymax.py
+# optymax_analysis.py
 """
-Análise OptyMax — TIO / IV Rank / Beta / Recomendação
+OptyMax — Análise Conservadora minimalista (CLI)
 
-Uso:
-  - Defina OPLAB_TOKEN no ambiente:
+Resumo:
+- Rejeita séries com close == 0
+- Calcula TIO (bruta) por série: TIO = (close / spot) * (365 / dtm) * 100
+- Calcula IV Rank por ativo (percentil do IV entre as séries do mesmo ativo)
+- Calcula Beta do ativo vs IBOV (via yfinance)
+- Gera relatório com formato RÍGIDO:
+    1. Análise por Lucratividade (TIO Bruta)
+    2. Análise por Risco e Segurança
+    3. Conclusão e Recomendação Final
+
+Modo de uso:
+  (A) Usando OPLAB (recomendado para dados reais)
+    - Defina variável de ambiente OPLAB_TOKEN com seu token
       export OPLAB_TOKEN="SEU_TOKEN_AQUI"
-  - Instale dependências:
-      pip install requests pandas numpy yfinance tqdm
-  - Rode:
-      python analysis_optymax.py PETR4 VALE3 PSSA3
+    - Rode:
+      python optymax_analysis.py PETR4 VALE3 PSSA3
 
-O que o script faz (resumido):
-  1) Para cada ticker informado, consulta /market/options/{UNDERLYING}
-  2) Rejeita séries com close == 0
-  3) Para cada série restante, chama /market/options/bs (via dados de details para parâmetros precisos) para obter delta e volatilidade
-  4) Calcula TIO por série: (close / spot) * (365 / dtm) * 100
-  5) Calcula IV Rank por ativo como percentil do IV entre as séries do mesmo ativo
-  6) Calcula Beta do ativo vs IBOV (usando yfinance) para o período de 1 ano
-  7) Gera relatório com o formato rígido exigido
-Observação: chame com poucos tickers para testes — cada ticker pode gerar muitas requisições.
+  (B) Modo offline (CSVs)
+    - Prepare CSV 'options.csv' com colunas:
+        parent,option_symbol,type,strike,close,spot,dtm,volume,open_interest,volatility
+      (volatility = implied vol decimal, e.g. 0.25)
+    - Prepare CSV 'betas.csv' (opcional) com:
+        parent,beta
+    - Rode:
+      python optymax_analysis.py --csv options.csv --betas betas.csv
+
+Observações:
+- Para precisão do delta usamos o endpoint /market/options/bs quando disponível,
+  mas o script NÃO depende do delta para ranking (ranking é por TIO e IV Rank).
+- O script tenta calcular IV Rank com as volatilidades disponíveis na cadeia.
+- Recomenda executar com poucos tickers (1-5) quando usando OPLAB ao vivo.
 """
 
 import os
 import sys
 import time
 import math
+import argparse
 from typing import List, Dict, Any
+
 import requests
 import pandas as pd
 import numpy as np
 
-# opcional progress bar
+# optional: progress bar if available
 try:
     from tqdm import tqdm
 except Exception:
     def tqdm(x, **_): return x
 
-# yfinance para beta
+# yfinance optional
 try:
     import yfinance as yf
     HAVE_YF = True
 except Exception:
     HAVE_YF = False
 
-# ---------------------------
-# Configuração
-# ---------------------------
+# -------------
+# CONFIG
+# -------------
 OPLAB_BASE = "https://api.oplab.com.br/v3"
 OPLAB_TOKEN = os.environ.get("OPLAB_TOKEN", "")
 HEADERS = {"Access-Token": OPLAB_TOKEN} if OPLAB_TOKEN else {}
-LOT_SIZE = 100
+SLEEP_BETWEEN_REQUESTS = 0.05     # gentle pause
+BETA_MARKET_SYMBOL = "^BVSP"      # IBOV for yfinance
+MIN_IVRANK_TRUST = 50.0          # % threshold to consider TIO trustworthy
 
-# parâmetros conservadores / defaults (ajustáveis)
-MIN_IVRANK_PERCENT = 50.0   # IV Rank mínimo (%) para considerar TIO "confiável"
-BETA_LOOKBACK_DAYS = 252    # ~1 ano de pregões
-MARKET_INDEX = "^BVSP"      # índice Bovespa (yfinance symbol)
-REQUEST_SLEEP = 0.05        # pausa entre requisições para não saturar API
-
-# ---------------------------
-# Utils e chamadas OPLAB
-# ---------------------------
-def safe_get(url: str, params=None, headers=None, timeout=10) -> Any:
+# -------------
+# HELPERS: HTTP safe get
+# -------------
+def safe_get(url: str, params: Dict[str, Any] = None, headers: Dict[str, str] = None, timeout: int = 10):
     try:
-        r = requests.get(url, params=params, headers=headers or HEADERS, timeout=timeout)
+        h = headers if headers is not None else HEADERS
+        r = requests.get(url, params=params, headers=h, timeout=timeout)
         if r.status_code == 200:
             return r.json()
         else:
-            # Retornar None para erros, log externo
-            # print(f"HTTP {r.status_code} -> {url} params={params}")
             return None
-    except Exception as e:
-        # print(f"Exception fetching {url}: {e}")
+    except Exception:
         return None
 
-def get_options_chain(underlying: str) -> pd.DataFrame:
-    """GET /market/options/{UNDERLYING} -> retorna DataFrame com as colunas essenciais"""
+# -------------
+# OPLAB calls
+# -------------
+def fetch_chain_oplab(underlying: str) -> pd.DataFrame:
     url = f"{OPLAB_BASE}/market/options/{underlying}"
     data = safe_get(url)
+    # Return empty DF on any issue
     if not data or not isinstance(data, list):
         return pd.DataFrame()
     rows = []
@@ -95,18 +108,19 @@ def get_options_chain(underlying: str) -> pd.DataFrame:
             "dtm": int(it.get("days_to_maturity") or 0),
             "volume": int(it.get("volume") or 0),
             "open_interest": int(it.get("open_interest") or 0),
+            "volatility": (float(it.get("volatility")) if it.get("volatility") not in (None,"") else None)
         })
     df = pd.DataFrame(rows)
     return df
 
-def get_option_details(symbol: str) -> Dict[str,Any]:
+def fetch_details_oplab(symbol: str) -> Dict[str,Any]:
     url = f"{OPLAB_BASE}/market/options/details/{symbol}"
     return safe_get(url)
 
-def get_bs_for_symbol_using_details(symbol: str) -> Dict[str,Any]:
-    """Consulta /market/options/details/{symbol} e em seguida /market/options/bs com parâmetros consistentes."""
-    details = get_option_details(symbol)
-    time.sleep(REQUEST_SLEEP)
+def fetch_bs_oplab_with_details(symbol: str) -> Dict[str,Any]:
+    # fetch details then /bs
+    details = fetch_details_oplab(symbol)
+    time.sleep(SLEEP_BETWEEN_REQUESTS)
     if not details:
         return {}
     params = {
@@ -119,57 +133,44 @@ def get_bs_for_symbol_using_details(symbol: str) -> Dict[str,Any]:
         "dtm": int(details.get("days_to_maturity") or 0),
         "vol": float(details.get("volatility") or 0.25),
         "duedate": details.get("due_date") or details.get("expiration"),
-        "amount": LOT_SIZE
+        "amount": 100
     }
     bs = safe_get(f"{OPLAB_BASE}/market/options/bs", params=params)
-    time.sleep(REQUEST_SLEEP)
+    time.sleep(SLEEP_BETWEEN_REQUESTS)
     return bs or {}
 
-# ---------------------------
-# Cálculos
-# ---------------------------
+# -------------
+# Calculations
+# -------------
 def compute_tio(close: float, spot: float, dtm: int) -> float:
-    """TIO = (close / spot) * (365 / dtm) * 100 — retorna em %"""
     try:
-        close_f = float(close)
-        spot_f = float(spot)
-        dtm_i = int(dtm)
-        if close_f <= 0 or spot_f <= 0 or dtm_i <= 0:
+        c = float(close); s = float(spot); d = int(dtm)
+        if c <= 0 or s <= 0 or d <= 0:
             return 0.0
-        # cálculo passo-a-passo (para precisão)
-        ratio = close_f / spot_f
-        factor = 365.0 / dtm_i
-        tio = ratio * factor * 100.0
-        return float(round(tio, 6))
+        return float((c / s) * (365.0 / d) * 100.0)
     except Exception:
         return 0.0
 
-def iv_rank_from_list(iv_list: List[float], value: float) -> float:
-    """Calcula percentil (0-100) de 'value' na lista iv_list."""
-    ivs = [v for v in iv_list if v is not None and not math.isnan(v)]
+def iv_rank_percentile(iv_list: List[float], value: float) -> float:
+    ivs = [v for v in iv_list if v is not None and not (isinstance(v,float) and math.isnan(v))]
     if not ivs:
         return 0.0
     ivs_sorted = sorted(ivs)
-    # percentile rank (percentage of items <= value)
     count_le = sum(1 for v in ivs_sorted if v <= value)
-    rank = (count_le / len(ivs_sorted)) * 100.0
-    return float(round(rank, 4))
+    return float((count_le / len(ivs_sorted)) * 100.0)
 
-def compute_beta(ticker: str, market_symbol: str = MARKET_INDEX, period_days: int = BETA_LOOKBACK_DAYS) -> float:
-    """Calcula Beta do ticker vs market usando yfinance (1y ~ 252 dias). Retorna NaN se indisponível."""
+def compute_beta_yf(ticker: str) -> float:
     if not HAVE_YF:
         return float("nan")
     try:
-        # yfinance symbols for BR tickers: add '.SA'
-        t = ticker if ticker.endswith(".SA") else f"{ticker}.SA"
-        m = market_symbol
-        df_t = yf.download(t, period="1y", progress=False)
-        df_m = yf.download(m, period="1y", progress=False)
+        sym = ticker if ticker.endswith(".SA") else f"{ticker}.SA"
+        market = BETA_MARKET_SYMBOL
+        df_t = yf.download(sym, period="1y", progress=False)
+        df_m = yf.download(market, period="1y", progress=False)
         if df_t.empty or df_m.empty:
             return float("nan")
         rt = df_t["Close"].pct_change().dropna()
         rm = df_m["Close"].pct_change().dropna()
-        # align
         df = pd.concat([rt, rm], axis=1, join="inner").dropna()
         if df.shape[0] < 30:
             return float("nan")
@@ -178,217 +179,217 @@ def compute_beta(ticker: str, market_symbol: str = MARKET_INDEX, period_days: in
         if var_m == 0 or math.isnan(cov):
             return float("nan")
         beta = cov / var_m
-        return float(round(beta, 4))
+        return float(beta)
     except Exception:
         return float("nan")
 
-# ---------------------------
-# Pipeline principal
-# ---------------------------
-def analyze_tickers(tickers: List[str]) -> Dict[str, Any]:
-    """
-    Retorna um dicionário com:
-      - per_underlying: dataframe com melhores séries, TIO, IV, delta, iv_rank, etc.
-      - betas: dataframe com betas
-      - report fields
-    """
+# -------------
+# Pipeline: analyze tickers (either via API or CSV)
+# -------------
+def analyze_with_api(tickers: List[str]) -> Dict[str, Any]:
     per_underlying = []
-
     for t in tqdm(tickers):
-        chain_df = get_options_chain(t)
-        if chain_df.empty:
-            # nenhum dado
+        chain = fetch_chain_oplab(t)
+        if chain.empty:
             continue
-
-        # Rejeitar séries com close == 0
-        chain_df = chain_df[chain_df["close"] > 0].copy()
-        if chain_df.empty:
+        # reject close == 0
+        chain = chain[chain["close"] > 0].copy()
+        if chain.empty:
             continue
+        # ensure numeric
+        chain["dtm"] = pd.to_numeric(chain["dtm"], errors="coerce").fillna(0).astype(int)
+        chain["spot"] = pd.to_numeric(chain["spot"], errors="coerce").fillna(0.0)
+        chain["close"] = pd.to_numeric(chain["close"], errors="coerce").fillna(0.0)
 
-        # Garantir tipos
-        chain_df["dtm"] = pd.to_numeric(chain_df["dtm"], errors="coerce").fillna(0).astype(int)
-        chain_df["spot"] = pd.to_numeric(chain_df["spot"], errors="coerce").fillna(0.0)
-        chain_df["close"] = pd.to_numeric(chain_df["close"], errors="coerce").fillna(0.0)
+        # compute TIO per series
+        chain["tio_pct"] = chain.apply(lambda r: compute_tio(r["close"], r["spot"], int(r["dtm"])), axis=1)
 
-        # Para cada série, obter BS (delta e iv) usando endpoint de detalhes + bs
-        ivs = []
-        deltas = []
-        bs_cache = {}  # option_symbol -> bs result
-        for idx, row in chain_df.iterrows():
-            sym = row["option_symbol"]
-            bs = get_bs_for_symbol_using_details(sym)
-            if bs and isinstance(bs, dict):
-                # tentativa de extrair volatilidade e delta
-                iv = None
-                delta = None
-                # possíveis chaves: 'volatility', 'vol', 'iv', 'delta'
-                if "volatility" in bs and bs["volatility"] is not None:
-                    try:
-                        iv = float(bs["volatility"])
-                    except:
-                        iv = None
-                elif "vol" in bs and bs["vol"] is not None:
-                    try:
-                        iv = float(bs["vol"])
-                    except:
-                        iv = None
-                if "delta" in bs and bs["delta"] is not None:
-                    try:
-                        delta = float(bs["delta"])
-                    except:
-                        delta = None
-                # armazenar
-                bs_cache[sym] = {"iv": iv, "delta": delta, "raw": bs}
-                ivs.append(iv)
-                deltas.append(delta)
-            else:
-                # sem bs válido -> append None placeholders
-                bs_cache[sym] = {"iv": None, "delta": None, "raw": bs}
-                ivs.append(None)
-                deltas.append(None)
-
-        # calcular TIO por série
-        chain_df["tio_pct"] = chain_df.apply(lambda r: compute_tio(r["close"], r["spot"], int(r["dtm"])), axis=1)
-
-        # associar bs data ao df
-        chain_df["iv"] = chain_df["option_symbol"].apply(lambda s: bs_cache.get(s, {}).get("iv"))
-        chain_df["delta"] = chain_df["option_symbol"].apply(lambda s: bs_cache.get(s, {}).get("delta"))
-
-        # calcular iv_rank relativo ao conjunto de ivs deste ativo (percentil)
-        # para cada série, se iv presente, compute percentile
-        iv_list = [v for v in chain_df["iv"].tolist() if v is not None and not math.isnan(v)]
-        chain_df["iv_rank_pct"] = chain_df["iv"].apply(lambda v: iv_rank_from_list(iv_list, v) if v is not None and not math.isnan(v) else 0.0)
-
-        # escolher a melhor série por TIO bruta (maior tio)
-        best_idx = chain_df["tio_pct"].idxmax() if not chain_df["tio_pct"].isnull().all() else None
-        if best_idx is not None and not pd.isna(best_idx):
-            best = chain_df.loc[best_idx].to_dict()
+        # collect IVs from chain if available; otherwise try to call /bs for top candidates only
+        ivs_available = chain["volatility"].dropna().tolist()
+        # if volatility missing for many, attempt to fetch bs for options with close>0 to get iv and delta (but keep limited)
+        missing_iv_count = chain["volatility"].isna().sum()
+        if missing_iv_count > 0 and len(chain) <= 200:  # only auto-call bs for reasonable chain sizes
+            # cache bs responses
+            bs_cache = {}
+            for sym in chain["option_symbol"].tolist():
+                bs = fetch_bs_oplab_with_details(sym)
+                if bs:
+                    iv = None
+                    if "volatility" in bs and bs["volatility"] is not None:
+                        try: iv = float(bs["volatility"])
+                        except: iv = None
+                    elif "vol" in bs and bs["vol"] is not None:
+                        try: iv = float(bs["vol"])
+                        except: iv = None
+                    # store
+                    bs_cache[sym] = {"iv": iv, "delta": bs.get("delta")}
+                time.sleep(SLEEP_BETWEEN_REQUESTS)
+            # map back
+            chain["iv"] = chain["option_symbol"].apply(lambda s: bs_cache.get(s, {}).get("iv"))
+            chain["delta"] = chain["option_symbol"].apply(lambda s: bs_cache.get(s, {}).get("delta"))
+            # fill from chain volatility if present
+            chain["iv"] = chain.apply(lambda r: r["iv"] if (r["iv"] is not None and not math.isnan(r["iv"])) else r["volatility"], axis=1)
         else:
-            best = None
+            # use chain volatility column directly
+            chain["iv"] = chain["volatility"]
+
+        # compute iv_rank per series (percentil within this underlying)
+        iv_list = [v for v in chain["iv"].tolist() if v is not None and not (isinstance(v,float) and math.isnan(v))]
+        chain["iv_rank_pct"] = chain["iv"].apply(lambda v: iv_rank_percentile(iv_list, v) if v is not None and not math.isnan(v) else 0.0)
+
+        # pick best series per underlying by tio_pct
+        best_idx = chain["tio_pct"].idxmax() if not chain["tio_pct"].isnull().all() else None
+        best = chain.loc[best_idx].to_dict() if best_idx is not None else None
 
         per_underlying.append({
             "parent": t,
-            "chain_df": chain_df,
+            "chain": chain,
             "best_series": best,
-            # estatísticas resumidas
-            "max_tio": float(chain_df["tio_pct"].max()),
+            "max_tio": float(chain["tio_pct"].max()),
             "best_option": best["option_symbol"] if best else None,
             "best_iv": float(best.get("iv")) if best and best.get("iv") is not None else None,
             "best_delta": float(best.get("delta")) if best and best.get("delta") is not None else None,
             "iv_rank_of_best": float(best.get("iv_rank_pct")) if best and best.get("iv_rank_pct") is not None else 0.0,
-            "n_series": len(chain_df)
+            "n_series": len(chain)
         })
-
-    # DataFrame resumo
-    summary_rows = []
-    for u in per_underlying:
-        summary_rows.append({
-            "parent": u["parent"],
-            "max_tio": u["max_tio"],
-            "best_option": u["best_option"],
-            "best_iv": u["best_iv"],
-            "best_delta": u["best_delta"],
-            "iv_rank_of_best": u["iv_rank_of_best"],
-            "n_series": u["n_series"]
-        })
-    summary_df = pd.DataFrame(summary_rows).sort_values(by="max_tio", ascending=False).reset_index(drop=True)
-
-    # calcular betas para cada underlying (usa yfinance se disponível)
+    # summary df
+    summary = pd.DataFrame([{
+        "parent": u["parent"],
+        "max_tio": u["max_tio"],
+        "best_option": u["best_option"],
+        "best_iv": u["best_iv"],
+        "best_delta": u["best_delta"],
+        "iv_rank_of_best": u["iv_rank_of_best"],
+        "n_series": u["n_series"]
+    } for u in per_underlying])
+    # compute betas
     betas = []
-    for u in tqdm(summary_df["parent"].tolist()):
-        if HAVE_YF:
-            b = compute_beta(u)
-        else:
-            b = float("nan")
-        betas.append({"parent": u, "beta": b})
+    for p in summary["parent"].tolist():
+        b = compute_beta_yf(p)
+        betas.append({"parent": p, "beta": b})
     betas_df = pd.DataFrame(betas)
-
-    # mesclar betas no summary
     if not betas_df.empty:
-        summary_df = summary_df.merge(betas_df, on="parent", how="left")
+        summary = summary.merge(betas_df, on="parent", how="left")
+    # mark tio trustworthy
+    summary["tio_trustworthy"] = summary["iv_rank_of_best"] >= MIN_IVRANK_TRUST
+    return {"per_underlying": per_underlying, "summary": summary, "betas": betas_df}
 
-    # marcar ativos com alta TIO mas IV Rank < MIN_IVRANK_PERCENT como "não confiável"
-    summary_df["tio_trustworthy"] = summary_df["iv_rank_of_best"] >= MIN_IVRANK_PERCENT
-
-    return {
-        "per_underlying": per_underlying,
-        "summary_df": summary_df,
-        "betas_df": betas_df
-    }
-
-# ---------------------------
-# Formatação de saída conforme requisitado
-# ---------------------------
-def build_rigorous_report(result: Dict[str, Any]) -> str:
-    summary_df: pd.DataFrame = result["summary_df"]
-    betas_df: pd.DataFrame = result["betas_df"]
-
-    # 1) Análise por Lucratividade (TIO Bruta) — top 3
-    top3 = summary_df.sort_values(by="max_tio", ascending=False).head(3)
-
-    # comentário sobre relação TIO e IV Rank:
-    # para cada top3, ver se tio_trustworthy True
-    comments = []
-    for _, r in top3.iterrows():
-        if r.get("tio_trustworthy"):
-            comments.append(f"{r['parent']} tem TIO elevada ({r['max_tio']:.2f}%) suportada por IV Rank {r['iv_rank_of_best']:.1f}%.")
-        else:
-            comments.append(f"{r['parent']} tem TIO elevada ({r['max_tio']:.2f}%) MAS IV Rank baixo ({r['iv_rank_of_best']:.1f}%) — cuidado: prêmio possivelmente enganoso.")
-
-    tio_comment_paragraph = " ".join(comments)
-
-    # 2) Risco e Segurança — 3 ativos com melhor perfil de segurança (beta baixo) — Beta < 1.0 preferred
-    # Use betas_df; se betas nan, we'll fallback to summary ordering
-    if not betas_df.empty:
-        betas_sorted = betas_df.sort_values(by="beta", ascending=True).head(3)
+def analyze_with_csv(options_csv: str, betas_csv: str = None) -> Dict[str, Any]:
+    df = pd.read_csv(options_csv)
+    # expected columns: parent,option_symbol,type,strike,close,spot,dtm,volume,open_interest,volatility
+    df = df.copy()
+    # reject close==0
+    df = df[df["close"] > 0]
+    if df.empty:
+        return {"per_underlying": [], "summary": pd.DataFrame(), "betas": pd.DataFrame()}
+    per = []
+    for parent, group in df.groupby("parent"):
+        g = group.copy()
+        g["tio_pct"] = g.apply(lambda r: compute_tio(r["close"], r["spot"], int(r["dtm"])), axis=1)
+        # iv_rank within group
+        iv_list = [v for v in g["volatility"].tolist() if v is not None and not (isinstance(v,float) and math.isnan(v))]
+        g["iv_rank_pct"] = g["volatility"].apply(lambda v: iv_rank_percentile(iv_list, v) if v is not None and not math.isnan(v) else 0.0)
+        best_idx = g["tio_pct"].idxmax() if not g["tio_pct"].isnull().all() else None
+        best = g.loc[best_idx].to_dict() if best_idx is not None else None
+        per.append({
+            "parent": parent,
+            "chain": g,
+            "best_series": best,
+            "max_tio": float(g["tio_pct"].max()),
+            "best_option": best["option_symbol"] if best else None,
+            "best_iv": float(best.get("volatility")) if best and best.get("volatility") is not None else None,
+            "best_delta": None,
+            "iv_rank_of_best": float(best.get("iv_rank_pct")) if best and best.get("iv_rank_pct") is not None else 0.0,
+            "n_series": len(g)
+        })
+    summary = pd.DataFrame([{
+        "parent": u["parent"],
+        "max_tio": u["max_tio"],
+        "best_option": u["best_option"],
+        "best_iv": u["best_iv"],
+        "best_delta": u["best_delta"],
+        "iv_rank_of_best": u["iv_rank_of_best"],
+        "n_series": u["n_series"]
+    } for u in per])
+    # betas
+    if betas_csv and os.path.exists(betas_csv):
+        betas_df = pd.read_csv(betas_csv)
     else:
-        betas_sorted = summary_df.sort_values(by="max_tio", ascending=True).head(3)[["parent"]].assign(beta=np.nan)
+        betas = []
+        for p in summary["parent"].tolist():
+            b = compute_beta_yf(p)
+            betas.append({"parent": p, "beta": b})
+        betas_df = pd.DataFrame(betas)
+    if not betas_df.empty:
+        summary = summary.merge(betas_df, on="parent", how="left")
+    summary["tio_trustworthy"] = summary["iv_rank_of_best"] >= MIN_IVRANK_TRUST
+    return {"per_underlying": per, "summary": summary, "betas": betas_df}
 
-    # determinar qual ativo permite maior alavancagem em lotes = normalmente ativo com menor preço spot e boa liquidez
-    # Como proxy, usamos spot do best option dividido por strike? Melhor: recuperar spot do per_underlying
-    # Vamos pegar spot médio da melhor série de cada underlying (se disponível) e open interest/volume summation
-    leverage_rows = []
-    for u in result["per_underlying"]:
-        best = u.get("best_series")
+# -------------
+# Output formatting: Strict as requested
+# -------------
+def build_report(result: Dict[str, Any]) -> str:
+    summary: pd.DataFrame = result["summary"]
+    betas_df: pd.DataFrame = result["betas"]
+    # 1) Top 3 by TIO
+    top3 = summary.sort_values("max_tio", ascending=False).head(3)
+    tio_comments = []
+    for _, r in top3.iterrows():
+        if r["tio_trustworthy"]:
+            tio_comments.append(f"{r['parent']} tem TIO elevada ({r['max_tio']:.2f}%) suportada por IV Rank {r['iv_rank_of_best']:.1f}%.")
+        else:
+            tio_comments.append(f"{r['parent']} tem TIO elevada ({r['max_tio']:.2f}%) MAS IV Rank baixo ({r['iv_rank_of_best']:.1f}%) — TIO pode ser enganosa.")
+    tio_comment_par = " ".join(tio_comments)
+
+    # 2) Risk & Safety: top3 lowest betas (prefer beta<1.0)
+    if not betas_df.empty and not betas_df["beta"].isnull().all():
+        betas_sorted = betas_df.sort_values("beta", ascending=True).head(3)
+    else:
+        # fallback: choose smallest max_tio as proxy (not ideal)
+        betas_sorted = summary.sort_values("max_tio", ascending=True).head(3)[["parent"]].assign(beta=np.nan)
+
+    # which asset allows more leverage in lots? heuristic: larger open interest and lower spot -> higher leverage score
+    leverage_list = []
+    for item in result["per_underlying"]:
+        best = item.get("best_series")
         if not best:
             continue
         spot = float(best.get("spot") or 0)
         oi = int(best.get("open_interest") or 0)
         vol = int(best.get("volume") or 0)
-        leverage_rows.append({"parent": u["parent"], "spot": spot, "open_interest": oi, "volume": vol})
-    leverage_df = pd.DataFrame(leverage_rows)
+        score = (oi + 1) / (spot + 1e-9)
+        leverage_list.append({"parent": item["parent"], "score": score, "spot": spot, "open_interest": oi, "volume": vol})
+    leverage_df = pd.DataFrame(leverage_list) if leverage_list else pd.DataFrame()
     if not leverage_df.empty:
-        # heurística: menor spot e maior open_interest = mais "alavancável"
-        # score = normalized open_interest / spot
-        leverage_df["score"] = leverage_df.apply(lambda r: (r["open_interest"] + 1) / (r["spot"] + 1e-9), axis=1)
-        best_leverage_row = leverage_df.sort_values(by="score", ascending=False).iloc[0]
-        leverage_comment = f"{best_leverage_row['parent']} permite maior alocação por lote (score liquidity/spot = {best_leverage_row['score']:.2f})."
+        best_lev = leverage_df.sort_values("score", ascending=False).iloc[0]
+        leverage_comment = f"{best_lev['parent']} permite maior alocação por lote (proxy score = {best_lev['score']:.2f}; spot={best_lev['spot']}, open_interest={best_lev['open_interest']})."
     else:
-        leverage_comment = "Dados de liquidez insuficientes para estimar alavancagem por lotes."
+        leverage_comment = "Dados insuficientes para estimar alavancagem por lotes."
 
-    # 3) Conclusão e Recomendação Final: escolher Ativo de Renda Máxima (principal) e Ativo de Estabilidade (secundário)
-    # Renda Máxima: top asset by max_tio but must be tio_trustworthy True if possible
-    candidates = summary_df[summary_df["tio_trustworthy"] == True]
-    if candidates.empty:
-        renda = summary_df.sort_values("max_tio", ascending=False).iloc[0]
-    else:
+    # 3) Conclusion: Renda Máxima (principal) and Estabilidade (secondary)
+    candidates = summary[summary["tio_trustworthy"] == True]
+    if not candidates.empty:
         renda = candidates.sort_values("max_tio", ascending=False).iloc[0]
+    elif not summary.empty:
+        renda = summary.sort_values("max_tio", ascending=False).iloc[0]
+    else:
+        renda = None
 
-    # Estabilidade: lowest beta (<1.0 preferred)
     if not betas_df.empty and not betas_df["beta"].isnull().all():
         estabilidade = betas_df.sort_values("beta", ascending=True).iloc[0]
+    elif not summary.empty:
+        estabilidade = summary.sort_values("max_tio", ascending=True).iloc[0]
     else:
-        # fallback to asset with lower tio volatility? choose asset with lowest max_tio
-        estabilidade = summary_df.sort_values("max_tio", ascending=True).iloc[0]
+        estabilidade = None
 
-    # Montar string formatada rigidamente
+    # Build strict text
     lines = []
     lines.append("1. Análise por Lucratividade (TIO Bruta)")
     lines.append("    - Apresentar o ranking dos 3 melhores ativos.")
     for _, r in top3.iterrows():
-        lines.append(f"        • {r['parent']}: TIO={r['max_tio']:.2f}% — melhor série: {r['best_option']} — IV(best)={r['best_iv'] if r['best_iv'] is not None else 'N/D'} — delta={r['best_delta'] if r['best_delta'] is not None else 'N/D'} — IV Rank={r['iv_rank_of_best']:.2f}%")
+        lines.append(f"        • {r['parent']}: TIO={r['max_tio']:.2f}% — melhor série: {r['best_option']} — IV(best)={r['best_iv'] if not pd.isna(r['best_iv']) else 'N/D'} — delta={r['best_delta'] if not pd.isna(r['best_delta']) else 'N/D'} — IV Rank={r['iv_rank_of_best']:.2f}%")
     lines.append("    - Comentar a relação entre TIO e IV Rank.")
-    lines.append(f"        {tio_comment_paragraph}")
+    lines.append(f"        {tio_comment_par}")
     lines.append("")
     lines.append("2. Análise por Risco e Segurança")
     lines.append("    - Apresentar os 3 ativos com melhor perfil de segurança (Beta < 1.0 ou mais próximos de zero).")
@@ -399,29 +400,46 @@ def build_rigorous_report(result: Dict[str, Any]) -> str:
     lines.append("")
     lines.append("3. Conclusão e Recomendação Final")
     lines.append("    - Indicar o Ativo de Renda Máxima (Principal) e o Ativo de Estabilidade (Secundário)")
-    lines.append(f"    - Ativo de Renda Máxima (Principal): {renda['parent']} — TIO={renda['max_tio']:.2f}% — série {renda['best_option']}")
-    lines.append(f"    - Ativo de Estabilidade (Secundário): {estabilidade['parent']} — Beta={estabilidade['beta'] if 'beta' in estabilidade else 'N/D'}")
-
+    if renda is not None:
+        lines.append(f"    - Ativo de Renda Máxima (Principal): {renda['parent']} — TIO={renda['max_tio']:.2f}% — série {renda['best_option']}")
+    else:
+        lines.append("    - Ativo de Renda Máxima (Principal): N/D")
+    if estabilidade is not None:
+        lines.append(f"    - Ativo de Estabilidade (Secundário): {estabilidade['parent']} — Beta={stabilidade['beta'] if 'beta' in estabilidade else 'N/D'}")
+    else:
+        lines.append("    - Ativo de Estabilidade (Secundário): N/D")
     return "\n".join(lines)
 
-# ---------------------------
-# Main entry
-# ---------------------------
-def main(argv):
-    if not OPLAB_TOKEN:
-        print("ERRO: variável de ambiente OPLAB_TOKEN não configurada. Defina antes de rodar.")
-        return
+# -------------
+# CLI entry
+# -------------
+def main():
+    parser = argparse.ArgumentParser(description="OptyMax minimal analysis (TIO / IV Rank / Beta)")
+    parser.add_argument("tickers", nargs="*", help="Tickers (ex: PETR4 VALE3). If --csv provided, tickers ignored.")
+    parser.add_argument("--csv", help="Use local options CSV instead of OPLAB API (columns: parent,option_symbol,type,strike,close,spot,dtm,volume,open_interest,volatility)")
+    parser.add_argument("--betas", help="Optional CSV with betas (columns: parent,beta)")
+    parser.add_argument("--sleep", type=float, default=SLEEP_BETWEEN_REQUESTS, help="Sleep between API calls (seconds)")
+    args = parser.parse_args()
 
-    if len(argv) < 2:
-        print("Uso: python analysis_optymax.py PETR4 VALE3 ...")
-        return
+    global SLEEP_BETWEEN_REQUESTS
+    SLEEP_BETWEEN_REQUESTS = args.sleep
 
-    tickers = argv[1:]
-    print(f"Analisando {len(tickers)} tickers: {', '.join(tickers)}")
-    res = analyze_tickers(tickers)
+    if args.csv:
+        if not os.path.exists(args.csv):
+            print(f"CSV file not found: {args.csv}")
+            return
+        res = analyze_with_csv(args.csv, args.betas)
+    else:
+        if not OPLAB_TOKEN:
+            print("ERROR: OPLAB_TOKEN not set. Either export OPLAB_TOKEN or use --csv mode.")
+            return
+        if not args.tickers:
+            print("Provide tickers or use --csv. Example: python optymax_analysis.py PETR4 VALE3")
+            return
+        res = analyze_with_api(args.tickers)
 
-    report = build_rigorous_report(res)
-    print("\n\n" + report + "\n\n")
+    report = build_report(res)
+    print("\n" + report + "\n")
 
 if __name__ == "__main__":
-    main(sys.argv)
+    main()
