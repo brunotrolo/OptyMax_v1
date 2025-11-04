@@ -1,19 +1,20 @@
-# OptyMax — MVP corrigido (requisitos do usuário)
+# 📈 OptyMax — MVP (B3 + OPLAB v3)
 
-Este pacote contém a versão do MVP atualizada para cumprir os requisitos descritos pelo usuário.
+Aplicativo em **Streamlit** focado em estratégias de **venda coberta** e **strangle vendido coberto** no mercado de opções da B3.
 
-## Principais cuidados
-- Defina a variável de ambiente `OPLAB_TOKEN` com seu Access-Token. Ex:
-  - `export OPLAB_TOKEN='SEU_TOKEN'`
-- O app tenta buscar tickers em https://www.dadosdemercado.com.br/acoes e usar endpoints da OPLAB v3.
-- Se a OPLAB não liberar a listagem da cadeia por ticker, o app usará um fallback sintético.
-- Para calcular IV Rank e Beta, o app usa `yfinance`. Instale dependência e garanta acesso à internet.
+## 🚀 Execução no Streamlit Cloud
+1. Faça **fork** ou **clone** deste repositório.
+2. Crie um app no [Streamlit Cloud](https://streamlit.io/cloud).
+3. Caminho principal: `app.py`
+4. No painel de “Secrets” do Streamlit Cloud, adicione:
+   ```bash
+   OPLAB_TOKEN="seu_access_token_aqui"
+   ```
 
-## Rodar localmente
-```
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-export OPLAB_TOKEN='SEU_TOKEN'
-streamlit run app.py
-```
+## ⚙️ Recursos
+- Seleção de até 3 tickers (com nomes das empresas)
+- Filtros de DTM, Delta (absoluto) e IV Rank
+- Consultas à **API OPLAB v3**
+- Cálculo de **TIO** e **IV Rank**
+- Exibição dos **Top 3 CALLs** e **Top 3 PUTs**
+- Montagem automática de **Strangles** com exportação CSV
