@@ -1,17 +1,17 @@
 # app.py
 """
-OptyMax — MVP Final
-Delta real (API OPLAB) + Filtro DTM + Filtro OTM + Tracking em tempo real
--------------------------------------------------------------------------------
-Fluxo:
-1️⃣ Listar opções — com filtros DTM aplicados
-2️⃣ Gerar recomendações — usando dados reais da OPLAB (delta, vol, spot, etc.)
--------------------------------------------------------------------------------
+OptyMax — MVP Final (Estratégia Conservadora)
+-----------------------------------------------------------
+Critérios:
+- CALL: strike > spot * 1.03 (mínimo 3% OTM)
+- PUT: strike < spot * 0.97 (mínimo 3% OTM)
+- Liquidez mínima: volume ≥ 10 e open interest ≥ 50
+- Delta: 0.12 ≤ |Δ| ≤ 0.28
+- Sem fallback de delta estimado (somente dados reais da API)
 """
 
 import os
 import time
-from datetime import datetime
 import pandas as pd
 import numpy as np
 import requests
@@ -25,14 +25,8 @@ OPLAB_TOKEN = os.environ.get("OPLAB_TOKEN", "")
 HEADERS = {"Access-Token": OPLAB_TOKEN} if OPLAB_TOKEN else {}
 LOT_SIZE = 100
 
-try:
-    import yfinance as yf
-    HAVE_YFINANCE = True
-except Exception:
-    HAVE_YFINANCE = False
-
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (Delta Real + Filtro OTM + Tracking)")
+st.title("📈 OptyMax — Estratégia Conservadora (Venda Coberta e Strangle OTM)")
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -61,7 +55,7 @@ def fetch_tickers_with_names():
         return [("PETR4","Petrobras PN"),("VALE3","Vale ON"),("ITUB4","Itaú Unibanco PN")]
 
 def fetch_options_chain_by_parent(parent: str, log_box):
-    """Obtém lista de opções de um ativo base diretamente da API OPLAB"""
+    """Obtém lista de opções via API OPLAB"""
     url = f"{OPLAB_BASE}/market/options/{parent}"
     try:
         log_box.text(f"[{parent}] 🔍 Consultando opções na OPLAB...")
@@ -104,7 +98,7 @@ def fetch_option_details(symbol: str):
     return None
 
 def fetch_bs_oplab_accurate(symbol: str, log_box):
-    """Consulta modelo Black-Scholes com dados reais da OPLAB"""
+    """Consulta Black-Scholes com dados reais da OPLAB"""
     details = fetch_option_details(symbol)
     if not details:
         return {}
@@ -133,20 +127,6 @@ def compute_tio(total_premium: float, spot_price: float, dtm: int):
         return 0.0
     return round((total_premium / spot_price) * (365 / dtm) * 100, 3)
 
-def compute_iv_rank(symbol: str, iv_today: float):
-    if not HAVE_YFINANCE or not iv_today:
-        return None
-    try:
-        data = yf.download(symbol + ".SA", period="1y", progress=False)
-        ret = data["Close"].pct_change().dropna()
-        vol = ret.rolling(21).std() * (252 ** 0.5)
-        vmin, vmax = vol.min(), vol.max()
-        if vmax - vmin == 0:
-            return None
-        return round((iv_today - vmin) / (vmax - vmin) * 100, 2)
-    except Exception:
-        return None
-
 # ============================================================
 # INTERFACE
 # ============================================================
@@ -158,12 +138,9 @@ ticker_map = {f"{t} — {n}": t for t, n in tickers}
 sel = st.sidebar.multiselect("Selecione até 3 tickers", opts, max_selections=3)
 dtm_min = st.sidebar.slider("DTM mínimo (dias)", 1, 365, 25)
 dtm_max = st.sidebar.slider("DTM máximo (dias)", 1, 365, 60)
-delta_min = st.sidebar.number_input("Delta mínimo (abs)", 0.01, 1.0, 0.10, step=0.01)
-delta_max = st.sidebar.number_input("Delta máximo (abs)", 0.01, 1.0, 0.25, step=0.01)
-iv_rank_min = st.sidebar.number_input("IV Rank mínimo (%)", 0.0, 100.0, 0.0, step=1.0)
 
 listar = st.sidebar.button("📋 Listar Opções")
-processar = st.sidebar.button("⚙️ Gerar Recomendações")
+processar = st.sidebar.button("⚙️ Gerar Recomendações (Conservadora)")
 
 if "opcoes" not in st.session_state:
     st.session_state["opcoes"] = {}
@@ -195,7 +172,7 @@ if listar and sel:
     progress_bar.empty()
 
 # ============================================================
-# ETAPA 2 — PROCESSAMENTO
+# ETAPA 2 — PROCESSAMENTO CONSERVADOR
 # ============================================================
 if processar:
     if not st.session_state["opcoes"]:
@@ -209,7 +186,7 @@ if processar:
         for i, tk in enumerate(st.session_state["opcoes"], start=1):
             df_chain = st.session_state["opcoes"][tk]
             progress_text.markdown(f"⚙️ **Processando `{tk}` ({i}/{total})**")
-            log_box.text(f"[{tk}] Calculando Black-Scholes com dados reais...")
+            log_box.text(f"[{tk}] Calculando Black-Scholes (modo conservador)...")
 
             df_chain["delta"], df_chain["iv"] = np.nan, np.nan
             for idx, row in df_chain.iterrows():
@@ -218,43 +195,26 @@ if processar:
                     if bs and "delta" in bs:
                         df_chain.at[idx,"delta"] = float(bs.get("delta", np.nan))
                         df_chain.at[idx,"iv"] = float(bs.get("volatility", np.nan))
-                    else:
-                        # fallback
-                        spot = float(row.get("spot") or 0)
-                        strike = float(row.get("strike") or 0)
-                        if spot > 0:
-                            m = (spot - strike) / spot
-                            delta_est = 0.5 + 0.4 * np.tanh(5*m)
-                            if row.get("type","").upper()=="PUT":
-                                delta_est = -abs(delta_est)
-                            df_chain.at[idx,"delta"] = delta_est
-                            log_box.text(f"[{tk}] (fallback) Δ≈{delta_est:.3f} em {row['option_symbol']}")
-                        else:
-                            df_chain.at[idx,"delta"] = np.nan
-                    time.sleep(0.02)
                 except Exception as e:
                     log_box.text(f"[{tk}] Erro BS: {e}")
                     continue
+                time.sleep(0.02)
 
-            # Aplicar filtros
+            # 🔹 Filtros conservadores
             df_chain["dtm"]=pd.to_numeric(df_chain["dtm"],errors="coerce").fillna(0).astype(int)
             df_chain["delta_abs"]=df_chain["delta"].abs()
             df_chain=df_chain[(df_chain["dtm"]>=dtm_min)&(df_chain["dtm"]<=dtm_max)]
-            df_chain=df_chain[(df_chain["delta_abs"]>=delta_min)&(df_chain["delta_abs"]<=delta_max)]
+            df_chain=df_chain[(df_chain["delta_abs"]>=0.12)&(df_chain["delta_abs"]<=0.28)]
+            df_chain=df_chain[(df_chain["volume"]>=10)&(df_chain["open_interest"]>=50)]
 
-            # 🔹 Filtro OTM — apenas fora do dinheiro
-            df_chain["is_otm"] = np.where(
-                ((df_chain["type"] == "CALL") & (df_chain["strike"] > df_chain["spot"])) |
-                ((df_chain["type"] == "PUT") & (df_chain["strike"] < df_chain["spot"])),
-                True, False
-            )
-            df_chain = df_chain[df_chain["is_otm"]]
+            # 🔹 Apenas OTM (3% fora do dinheiro)
+            df_chain["is_otm"]=np.where(
+                ((df_chain["type"]=="CALL")&(df_chain["strike"]>df_chain["spot"]*1.03))|
+                ((df_chain["type"]=="PUT")&(df_chain["strike"]<df_chain["spot"]*0.97)),
+                True,False)
+            df_chain=df_chain[df_chain["is_otm"]]
 
-            if HAVE_YFINANCE:
-                df_chain["iv_rank"]=df_chain["iv"].apply(lambda v:compute_iv_rank(tk,v) if pd.notna(v) else None)
-            else:
-                df_chain["iv_rank"]=None
-
+            # 🔹 Seleção final
             calls=(df_chain[df_chain["type"]=="CALL"]
                 .sort_values(by=["strike"],ascending=True).head(3))
             puts=(df_chain[df_chain["type"]=="PUT"]
@@ -275,22 +235,21 @@ if processar:
                     "put_symbol":best_put["option_symbol"],
                     "total_premium":total_prem,
                     "tio":tio,
-                    "dtm":best_call["dtm"],
-                    "iv_rank":best_call.get("iv_rank",None)
+                    "dtm":best_call["dtm"]
                 })
             progress_bar.progress(i/total)
 
-        progress_text.markdown("✅ **Processamento concluído com filtro OTM!**")
+        progress_text.markdown("✅ **Processamento concluído — Estratégia Conservadora!**")
         progress_bar.empty()
 
         if all_calls:
-            st.subheader("📈 CALLs OTM Selecionadas")
-            st.dataframe(pd.concat(all_calls)[["ticker","option_symbol","strike","spot","dtm","close","delta","iv","iv_rank"]])
+            st.subheader("📈 CALLs OTM Selecionadas (Conservadoras)")
+            st.dataframe(pd.concat(all_calls)[["ticker","option_symbol","strike","spot","dtm","close","delta","volume","open_interest"]])
         if all_puts:
-            st.subheader("📉 PUTs OTM Selecionadas")
-            st.dataframe(pd.concat(all_puts)[["ticker","option_symbol","strike","spot","dtm","close","delta","iv","iv_rank"]])
+            st.subheader("📉 PUTs OTM Selecionadas (Conservadoras)")
+            st.dataframe(pd.concat(all_puts)[["ticker","option_symbol","strike","spot","dtm","close","delta","volume","open_interest"]])
         if all_strangles:
-            st.subheader("🔁 Strangles Montados")
+            st.subheader("🔁 Strangles Montados (Conservadores)")
             dfs=pd.DataFrame(all_strangles).sort_values(by="tio",ascending=False)
             st.dataframe(dfs)
             st.download_button("💾 Exportar CSV",dfs.to_csv(index=False),"strangles.csv")
