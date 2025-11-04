@@ -1,5 +1,14 @@
-
 # app.py
+"""
+OptyMax — MVP Final com integração real com a API OPLAB v3
+---------------------------------------------------------
+- Lista automática de tickers da B3 (com nome da empresa)
+- Busca real de opções com endpoint /market/options/{UNDERLYING}
+- Delta min/max aplicados a CALL e PUT
+- Cálculo de TIO e IV Rank
+- Sem geração de dados sintéticos
+"""
+
 import os
 import time
 from datetime import datetime, date, timedelta
@@ -8,9 +17,9 @@ import numpy as np
 import requests
 import streamlit as st
 
-# ===============================================
+# ============================================================
 # CONFIGURAÇÕES GERAIS
-# ===============================================
+# ============================================================
 OPLAB_BASE = "https://api.oplab.com.br/v3"
 OPLAB_TOKEN = os.environ.get("OPLAB_TOKEN", "")
 HEADERS = {"Access-Token": OPLAB_TOKEN} if OPLAB_TOKEN else {}
@@ -23,12 +32,13 @@ except Exception:
     HAVE_YFINANCE = False
 
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (MVP Final)")
+st.title("📈 OptyMax — Venda Coberta e Strangle (OPLAB v3 Integrado)")
 
-# ===============================================
+# ============================================================
 # FUNÇÕES AUXILIARES
-# ===============================================
+# ============================================================
 def fetch_tickers_with_names():
+    """Obtém lista de (ticker, nome da empresa) da B3 via dadosdemercado.com.br"""
     try:
         url = "https://www.dadosdemercado.com.br/acoes"
         r = requests.get(url, timeout=10)
@@ -53,6 +63,7 @@ def fetch_tickers_with_names():
         return [("PETR4", "Petrobras PN"), ("VALE3", "Vale ON"),
                 ("ITUB4", "Itaú Unibanco PN"), ("BBDC4", "Bradesco PN"), ("ABEV3", "Ambev ON")]
 
+
 def days_to_maturity_from_date(due_str: str):
     try:
         dt = datetime.fromisoformat(due_str.split("T")[0]).date()
@@ -60,39 +71,40 @@ def days_to_maturity_from_date(due_str: str):
     except Exception:
         return 0
 
+
 def fetch_options_chain_by_parent(parent: str):
-    endpoints = [
-        f"{OPLAB_BASE}/market/options/series/{parent}",
-        f"{OPLAB_BASE}/market/options/chain/{parent}",
-        f"{OPLAB_BASE}/market/options/instruments/{parent}",
-    ]
-    for url in endpoints:
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=8)
-            if r.status_code != 200:
-                continue
+    """Obtém lista de opções de um ativo base diretamente da API OPLAB"""
+    url = f"{OPLAB_BASE}/market/options/{parent}"
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
             data = r.json()
-            items = data.get("data") if isinstance(data, dict) and "data" in data else data
-            if not isinstance(items, list):
-                continue
-            rows = []
-            for it in items:
-                rows.append({
-                    "option_symbol": it.get("symbol"),
-                    "type": (it.get("category") or it.get("type") or "").lower(),
-                    "strike": float(it.get("strike") or it.get("strike_eod") or 0),
-                    "expiration": it.get("due_date"),
-                    "bid": float(it.get("bid") or 0),
-                    "spot": float(it.get("spot_price") or it.get("spot") or 0),
-                    "dtm": int(it.get("days_to_maturity") or days_to_maturity_from_date(it.get("due_date") or "0")),
-                })
-            if rows:
+            if isinstance(data, list) and len(data) > 0:
+                rows = []
+                for it in data:
+                    rows.append({
+                        "option_symbol": it.get("symbol"),
+                        "type": (it.get("type") or "").upper(),
+                        "strike": float(it.get("strike") or 0),
+                        "expiration": it.get("due_date"),
+                        "bid": float(it.get("bid") or 0),
+                        "ask": float(it.get("ask") or 0),
+                        "spot": float(it.get("spot_price") or 0),
+                        "dtm": int(it.get("days_to_maturity") or 0),
+                        "open_interest": int(it.get("open_interest") or 0),
+                        "volume": int(it.get("volume") or 0),
+                        "parent_symbol": parent
+                    })
                 return pd.DataFrame(rows)
-        except Exception:
-            continue
+            else:
+                st.warning(f"Nenhum dado retornado para {parent}.")
+    except Exception as e:
+        st.error(f"Erro ao consultar API OPLAB para {parent}: {e}")
     return pd.DataFrame()
 
+
 def fetch_bs_oplab(params: dict):
+    """Consulta modelo Black-Scholes na OPLAB"""
     url = f"{OPLAB_BASE}/market/options/bs"
     try:
         r = requests.get(url, headers=HEADERS, params=params, timeout=8)
@@ -102,12 +114,16 @@ def fetch_bs_oplab(params: dict):
         pass
     return {}
 
+
 def compute_tio(total_premium: float, spot_price: float, dtm: int):
+    """TIO anualizado"""
     if dtm <= 0 or spot_price <= 0:
         return 0.0
     return round((total_premium / spot_price) * (365 / dtm) * 100, 3)
 
+
 def compute_iv_rank(symbol: str, iv_today: float):
+    """Calcula IV Rank com base na volatilidade histórica"""
     if not HAVE_YFINANCE or not iv_today:
         return None
     try:
@@ -123,9 +139,9 @@ def compute_iv_rank(symbol: str, iv_today: float):
     except Exception:
         return None
 
-# ===============================================
+# ============================================================
 # INTERFACE DO USUÁRIO
-# ===============================================
+# ============================================================
 st.sidebar.header("Filtros — aplicados a CALL e PUT")
 
 tickers_with_names = fetch_tickers_with_names()
@@ -140,9 +156,9 @@ delta_max = st.sidebar.number_input("Delta máximo (valor absoluto)", 0.01, 1.0,
 iv_rank_min = st.sidebar.number_input("IV Rank mínimo (%)", 0.0, 100.0, 0.0, step=1.0)
 run = st.sidebar.button("Executar")
 
-# ===============================================
+# ============================================================
 # EXECUÇÃO PRINCIPAL
-# ===============================================
+# ============================================================
 if run and sel:
     selected_tickers = [ticker_map[s] for s in sel]
     all_calls, all_puts, all_strangles = [], [], []
@@ -152,30 +168,17 @@ if run and sel:
         df_chain = fetch_options_chain_by_parent(tk)
 
         if df_chain.empty:
-            st.warning(f"Sem dados da OPLAB — gerando dados sintéticos para {tk}.")
-            spot = 100
-            strikes = np.linspace(80, 120, 9)
-            rows = []
-            for s in strikes:
-                for typ in ["call", "put"]:
-                    rows.append({
-                        "option_symbol": f"{tk}-{typ.upper()}-{s:.2f}",
-                        "type": typ,
-                        "strike": s,
-                        "expiration": (date.today() + timedelta(days=45)).isoformat(),
-                        "bid": round(spot * 0.02, 2),
-                        "spot": spot,
-                        "dtm": 45
-                    })
-            df_chain = pd.DataFrame(rows)
+            st.warning(f"Nenhum dado encontrado para {tk}. Verifique o token OPLAB.")
+            continue
 
+        # Consultar Black-Scholes para delta e IV
         df_chain["delta"], df_chain["iv"] = np.nan, np.nan
         for idx, row in df_chain.iterrows():
             try:
                 params = {
                     "symbol": row["option_symbol"],
                     "irate": 0.1,
-                    "type": row["type"].upper(),
+                    "type": row["type"],
                     "spotprice": row["spot"],
                     "strike": row["strike"],
                     "premium": row["bid"],
@@ -191,17 +194,20 @@ if run and sel:
                 continue
             time.sleep(0.02)
 
+        # Filtragem
         df_chain["delta_abs"] = df_chain["delta"].abs()
         df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
         df_chain = df_chain[(df_chain["delta_abs"] >= delta_min) & (df_chain["delta_abs"] <= delta_max)]
 
+        # Calcular IV Rank
         if HAVE_YFINANCE:
             df_chain["iv_rank"] = df_chain["iv"].apply(lambda v: compute_iv_rank(tk, v) if pd.notna(v) else None)
         else:
             df_chain["iv_rank"] = None
 
-        calls = df_chain[df_chain["type"] == "call"].sort_values(by="bid", ascending=False).head(3)
-        puts = df_chain[df_chain["type"] == "put"].sort_values(by="bid", ascending=False).head(3)
+        # Top 3 CALLs e PUTs
+        calls = df_chain[df_chain["type"] == "CALL"].sort_values(by="bid", ascending=False).head(3)
+        puts = df_chain[df_chain["type"] == "PUT"].sort_values(by="bid", ascending=False).head(3)
         if not calls.empty:
             calls["ticker"] = tk
             all_calls.append(calls)
@@ -209,6 +215,7 @@ if run and sel:
             puts["ticker"] = tk
             all_puts.append(puts)
 
+        # Criar strangle simples
         if not calls.empty and not puts.empty:
             best_call, best_put = calls.iloc[0], puts.iloc[0]
             total_premium = best_call["bid"] + best_put["bid"]
