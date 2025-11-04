@@ -1,12 +1,11 @@
 # app.py
 """
-OptyMax — MVP Final com integração real com API OPLAB e tracking em tempo real
------------------------------------------------------------------------------
-- Busca real das opções via endpoint /market/options/{UNDERLYING}
-- Barra de progresso e log dinâmico de execução
-- Delta min/max aplicados a CALL e PUT
-- Cálculo de TIO e IV Rank (via yfinance)
-- Sem geração de dados sintéticos
+OptyMax — MVP Final (2 Etapas: Listagem + Processamento)
+-------------------------------------------------------
+- Etapa 1: Listar opções (consulta leve à API OPLAB)
+- Etapa 2: Processar recomendações (cálculos de Delta, IV Rank e TIO)
+- Tracking em tempo real com barra de progresso
+- Integração direta com a API OPLAB v3
 """
 
 import os
@@ -32,7 +31,7 @@ except Exception:
     HAVE_YFINANCE = False
 
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (OPLAB v3 + Tracking Tempo Real)")
+st.title("📈 OptyMax — Venda Coberta e Strangle (2 Etapas + Tracking Tempo Real)")
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -99,7 +98,7 @@ def fetch_options_chain_by_parent(parent: str, log_box):
                 log_box.text(f"[{parent}] ✅ {len(rows)} opções carregadas da OPLAB.")
                 return pd.DataFrame(rows)
             else:
-                log_box.text(f"[{parent}] ⚠️ Nenhum dado de opção retornado.")
+                log_box.text(f"[{parent}] ⚠️ Nenhum dado retornado.")
         else:
             log_box.text(f"[{parent}] ❌ Erro HTTP {r.status_code}")
     except Exception as e:
@@ -158,114 +157,132 @@ dtm_max = st.sidebar.slider("DTM máximo (dias)", 1, 365, 60)
 delta_min = st.sidebar.number_input("Delta mínimo (valor absoluto)", 0.01, 1.0, 0.10, step=0.01)
 delta_max = st.sidebar.number_input("Delta máximo (valor absoluto)", 0.01, 1.0, 0.25, step=0.01)
 iv_rank_min = st.sidebar.number_input("IV Rank mínimo (%)", 0.0, 100.0, 0.0, step=1.0)
-run = st.sidebar.button("Executar")
+
+listar = st.sidebar.button("📋 Listar Opções")
+processar = st.sidebar.button("⚙️ Gerar Recomendações")
+
+# Inicializar session state
+if "opcoes" not in st.session_state:
+    st.session_state["opcoes"] = {}
 
 # ============================================================
-# EXECUÇÃO PRINCIPAL
+# ETAPA 1 — LISTAR OPÇÕES
 # ============================================================
-if run and sel:
-    selected_tickers = [ticker_map[s] for s in sel]
-    all_calls, all_puts, all_strangles = [], [], []
-
+if listar and sel:
+    st.session_state["opcoes"].clear()
     progress_text = st.empty()
     log_box = st.empty()
     progress_bar = st.progress(0)
-
+    selected_tickers = [ticker_map[s] for s in sel]
     total = len(selected_tickers)
+
     for i, tk in enumerate(selected_tickers, start=1):
-        progress_text.markdown(f"🚀 **Processando `{tk}` ({i}/{total})**")
-        log_box.text(f"[{tk}] Iniciando processamento...")
-
-        # 1️⃣ Buscar opções da OPLAB
-        df_chain = fetch_options_chain_by_parent(tk, log_box)
-        if df_chain.empty:
-            st.warning(f"Nenhum dado retornado para {tk}. Verifique token OPLAB.")
-            progress_bar.progress(i / total)
-            continue
-
-        # 2️⃣ Consultar Black-Scholes
-        log_box.text(f"[{tk}] Calculando Greeks via Black-Scholes...")
-        df_chain["delta"], df_chain["iv"] = np.nan, np.nan
-        for idx, row in df_chain.iterrows():
-            try:
-                params = {
-                    "symbol": row["option_symbol"],
-                    "irate": 0.1,
-                    "type": row["type"],
-                    "spotprice": row["spot"],
-                    "strike": row["strike"],
-                    "premium": row["bid"],
-                    "dtm": row["dtm"],
-                    "vol": 0.3,
-                    "duedate": row["expiration"],
-                    "amount": LOT_SIZE,
-                }
-                bs = fetch_bs_oplab(params, log_box)
-                df_chain.at[idx, "delta"] = bs.get("delta", np.nan)
-                df_chain.at[idx, "iv"] = bs.get("volatility", np.nan)
-            except Exception:
-                continue
-            time.sleep(0.02)
-
-        # 3️⃣ Aplicar filtros
-        log_box.text(f"[{tk}] Aplicando filtros e selecionando melhores CALLs/PUTs...")
-        df_chain["delta_abs"] = df_chain["delta"].abs()
-        df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
-        df_chain = df_chain[(df_chain["delta_abs"] >= delta_min) & (df_chain["delta_abs"] <= delta_max)]
-
-        # 4️⃣ Calcular IV Rank
-        if HAVE_YFINANCE:
-            df_chain["iv_rank"] = df_chain["iv"].apply(lambda v: compute_iv_rank(tk, v) if pd.notna(v) else None)
-        else:
-            df_chain["iv_rank"] = None
-
-        # 5️⃣ Selecionar CALLs e PUTs
-        calls = df_chain[df_chain["type"] == "CALL"].sort_values(by="bid", ascending=False).head(3)
-        puts = df_chain[df_chain["type"] == "PUT"].sort_values(by="bid", ascending=False).head(3)
-        if not calls.empty:
-            calls["ticker"] = tk
-            all_calls.append(calls)
-        if not puts.empty:
-            puts["ticker"] = tk
-            all_puts.append(puts)
-
-        # 6️⃣ Montar Strangle
-        if not calls.empty and not puts.empty:
-            best_call, best_put = calls.iloc[0], puts.iloc[0]
-            total_premium = best_call["bid"] + best_put["bid"]
-            tio = compute_tio(total_premium, best_call["spot"], best_call["dtm"])
-            all_strangles.append({
-                "ticker": tk,
-                "call_symbol": best_call["option_symbol"],
-                "put_symbol": best_put["option_symbol"],
-                "total_premium": total_premium,
-                "tio": tio,
-                "dtm": best_call["dtm"],
-                "iv_rank": best_call.get("iv_rank", None)
-            })
-        log_box.text(f"[{tk}] ✅ Finalizado.")
+        progress_text.markdown(f"📊 **Listando opções de `{tk}` ({i}/{total})**")
+        df = fetch_options_chain_by_parent(tk, log_box)
+        if not df.empty:
+            st.session_state["opcoes"][tk] = df
+            st.subheader(f"📈 {tk} — Opções disponíveis ({len(df)})")
+            st.dataframe(df[["option_symbol", "type", "strike", "bid", "ask", "expiration", "dtm", "spot"]])
         progress_bar.progress(i / total)
 
-    progress_text.markdown("✅ **Processamento concluído!**")
-    log_box.text("Todos os tickers foram processados com sucesso.")
+    progress_text.markdown("✅ **Listagem concluída!**")
     progress_bar.empty()
+    log_box.text("Todos os tickers foram listados com sucesso.")
 
-    # Exibir resultados finais
-    if all_calls:
-        st.subheader("📈 CALLs Selecionadas")
-        dfc = pd.concat(all_calls)
-        st.dataframe(dfc[["ticker", "option_symbol", "strike", "dtm", "bid", "delta", "iv", "iv_rank"]])
+# ============================================================
+# ETAPA 2 — PROCESSAR RECOMENDAÇÕES
+# ============================================================
+if processar:
+    if not st.session_state["opcoes"]:
+        st.warning("⚠️ Nenhuma opção listada ainda. Clique primeiro em '📋 Listar Opções'.")
+    else:
+        progress_text = st.empty()
+        log_box = st.empty()
+        progress_bar = st.progress(0)
 
-    if all_puts:
-        st.subheader("📉 PUTs Selecionadas")
-        dfp = pd.concat(all_puts)
-        st.dataframe(dfp[["ticker", "option_symbol", "strike", "dtm", "bid", "delta", "iv", "iv_rank"]])
+        all_calls, all_puts, all_strangles = [], [], []
+        tickers_listados = list(st.session_state["opcoes"].keys())
+        total = len(tickers_listados)
 
-    if all_strangles:
-        st.subheader("🔁 Strangles Montados")
-        dfs = pd.DataFrame(all_strangles).sort_values(by="tio", ascending=False)
-        st.dataframe(dfs)
-        st.download_button("💾 Exportar CSV", dfs.to_csv(index=False), "strangles.csv")
+        for i, tk in enumerate(tickers_listados, start=1):
+            df_chain = st.session_state["opcoes"][tk]
+            progress_text.markdown(f"⚙️ **Processando `{tk}` ({i}/{total})**")
+            log_box.text(f"[{tk}] Calculando Black-Scholes e aplicando filtros...")
 
-else:
-    st.info("Selecione até 3 tickers e clique em Executar.")
+            df_chain["delta"], df_chain["iv"] = np.nan, np.nan
+            for idx, row in df_chain.iterrows():
+                try:
+                    params = {
+                        "symbol": row["option_symbol"],
+                        "irate": 0.1,
+                        "type": row["type"],
+                        "spotprice": row["spot"],
+                        "strike": row["strike"],
+                        "premium": row["bid"],
+                        "dtm": row["dtm"],
+                        "vol": 0.3,
+                        "duedate": row["expiration"],
+                        "amount": LOT_SIZE,
+                    }
+                    bs = fetch_bs_oplab(params, log_box)
+                    df_chain.at[idx, "delta"] = bs.get("delta", np.nan)
+                    df_chain.at[idx, "iv"] = bs.get("volatility", np.nan)
+                except Exception:
+                    continue
+                time.sleep(0.02)
+
+            # Filtragem
+            df_chain["delta_abs"] = df_chain["delta"].abs()
+            df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
+            df_chain = df_chain[(df_chain["delta_abs"] >= delta_min) & (df_chain["delta_abs"] <= delta_max)]
+
+            if HAVE_YFINANCE:
+                df_chain["iv_rank"] = df_chain["iv"].apply(lambda v: compute_iv_rank(tk, v) if pd.notna(v) else None)
+            else:
+                df_chain["iv_rank"] = None
+
+            calls = df_chain[df_chain["type"] == "CALL"].sort_values(by="bid", ascending=False).head(3)
+            puts = df_chain[df_chain["type"] == "PUT"].sort_values(by="bid", ascending=False).head(3)
+
+            if not calls.empty:
+                calls["ticker"] = tk
+                all_calls.append(calls)
+            if not puts.empty:
+                puts["ticker"] = tk
+                all_puts.append(puts)
+
+            if not calls.empty and not puts.empty:
+                best_call, best_put = calls.iloc[0], puts.iloc[0]
+                total_premium = best_call["bid"] + best_put["bid"]
+                tio = compute_tio(total_premium, best_call["spot"], best_call["dtm"])
+                all_strangles.append({
+                    "ticker": tk,
+                    "call_symbol": best_call["option_symbol"],
+                    "put_symbol": best_put["option_symbol"],
+                    "total_premium": total_premium,
+                    "tio": tio,
+                    "dtm": best_call["dtm"],
+                    "iv_rank": best_call.get("iv_rank", None)
+                })
+            log_box.text(f"[{tk}] ✅ Processamento concluído.")
+            progress_bar.progress(i / total)
+
+        progress_text.markdown("✅ **Todas as recomendações foram processadas!**")
+        log_box.text("Todos os tickers foram processados com sucesso.")
+        progress_bar.empty()
+
+        if all_calls:
+            st.subheader("📈 CALLs Selecionadas")
+            dfc = pd.concat(all_calls)
+            st.dataframe(dfc[["ticker", "option_symbol", "strike", "dtm", "bid", "delta", "iv", "iv_rank"]])
+
+        if all_puts:
+            st.subheader("📉 PUTs Selecionadas")
+            dfp = pd.concat(all_puts)
+            st.dataframe(dfp[["ticker", "option_symbol", "strike", "dtm", "bid", "delta", "iv", "iv_rank"]])
+
+        if all_strangles:
+            st.subheader("🔁 Strangles Montados")
+            dfs = pd.DataFrame(all_strangles).sort_values(by="tio", ascending=False)
+            st.dataframe(dfs)
+            st.download_button("💾 Exportar CSV", dfs.to_csv(index=False), "strangles.csv")
