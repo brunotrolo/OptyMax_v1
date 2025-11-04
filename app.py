@@ -1,10 +1,13 @@
 # app.py
 """
-OptyMax — MVP Final (Black-Scholes Robust + Filtro DTM Corrigido + Tracking)
-------------------------------------------------------------
-- Etapa 1: Lista opções com filtro DTM aplicado
-- Etapa 2: Processa recomendações com fallback e tracking em tempo real
-- Base de cálculo: CLOSE, com fallback seguro
+OptyMax — MVP Final (Delta Precisão API OPLAB + Filtro DTM Corrigido + Tracking Tempo Real)
+-------------------------------------------------------------------------------------------
+- Calcula Delta e outras gregas com base em dados reais da OPLAB
+- Usa endpoints:
+    1️⃣ /market/options/details/{symbol}
+    2️⃣ /market/options/bs
+- Mantém 2 etapas (Listagem + Processamento)
+- Tracking em tempo real com logs
 """
 
 import os
@@ -30,7 +33,7 @@ except Exception:
     HAVE_YFINANCE = False
 
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (Filtro DTM + CLOSE + Tracking Tempo Real)")
+st.title("📈 OptyMax — Venda Coberta e Strangle (Delta Real OPLAB + Tracking Tempo Real)")
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -50,16 +53,16 @@ def fetch_tickers_with_names():
                 if len(code) in (5, 6) and any(ch.isdigit() for ch in code):
                     tickers.append((code, name))
         if not tickers:
-            return [("PETR4","Petrobras PN"),("VALE3","Vale ON"),("ITUB4","Itaú Unibanco PN")]
+            return [("PETR4", "Petrobras PN"), ("VALE3", "Vale ON"), ("ITUB4", "Itaú Unibanco PN")]
         seen = {}
         for t, n in tickers:
             if t not in seen: seen[t] = n
         return list(seen.items())
     except Exception:
-        return [("PETR4","Petrobras PN"),("VALE3","Vale ON"),("ITUB4","Itaú Unibanco PN")]
+        return [("PETR4", "Petrobras PN"), ("VALE3", "Vale ON"), ("ITUB4", "Itaú Unibanco PN")]
 
 def fetch_options_chain_by_parent(parent: str, log_box):
-    """Obtém lista de opções via API OPLAB"""
+    """Obtém lista de opções de um ativo base diretamente da API OPLAB"""
     url = f"{OPLAB_BASE}/market/options/{parent}"
     try:
         log_box.text(f"[{parent}] 🔍 Consultando opções na OPLAB...")
@@ -90,15 +93,40 @@ def fetch_options_chain_by_parent(parent: str, log_box):
         log_box.text(f"[{parent}] ❌ Erro ao consultar API: {e}")
     return pd.DataFrame()
 
-def fetch_bs_oplab(params: dict, log_box):
-    """Consulta modelo Black-Scholes na OPLAB"""
+def fetch_option_details(symbol: str):
+    """Obtém dados reais de uma opção via /market/options/details/{symbol}"""
     try:
-        url = f"{OPLAB_BASE}/market/options/bs"
-        r = requests.get(url, headers=HEADERS, params=params, timeout=8)
+        url = f"{OPLAB_BASE}/market/options/details/{symbol}"
+        r = requests.get(url, headers=HEADERS, timeout=10)
+        if r.status_code == 200:
+            return r.json()
+    except Exception:
+        pass
+    return None
+
+def fetch_bs_oplab_accurate(symbol: str, log_box):
+    """Consulta Black-Scholes com dados reais da OPLAB"""
+    details = fetch_option_details(symbol)
+    if not details:
+        return {}
+    try:
+        params = {
+            "symbol": details.get("symbol"),
+            "irate": 0.1,  # taxa de juros anual (10%)
+            "type": details.get("category", "").upper(),
+            "spotprice": float(details.get("spot_price", 0)),
+            "strike": float(details.get("strike", 0)),
+            "premium": float(details.get("close", 0) or details.get("bid", 0) or details.get("ask", 0) or 0.01),
+            "dtm": int(details.get("days_to_maturity", 0)),
+            "vol": float(details.get("volatility", 0.25)),  # volatilidade real ou default
+            "duedate": details.get("due_date", ""),
+            "amount": 100
+        }
+        r = requests.get(f"{OPLAB_BASE}/market/options/bs", headers=HEADERS, params=params, timeout=10)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
-        log_box.text(f"Erro BS: {e}")
+        log_box.text(f"Erro em BS detalhado: {e}")
     return {}
 
 def compute_tio(total_premium: float, spot_price: float, dtm: int):
@@ -182,67 +210,38 @@ if processar:
         for i, tk in enumerate(st.session_state["opcoes"], start=1):
             df_chain = st.session_state["opcoes"][tk]
             progress_text.markdown(f"⚙️ **Processando `{tk}` ({i}/{total})**")
-            log_box.text(f"[{tk}] Calculando Black-Scholes e aplicando filtros...")
+            log_box.text(f"[{tk}] Calculando Black-Scholes com dados reais...")
 
             df_chain["delta"], df_chain["iv"] = np.nan, np.nan
             for idx, row in df_chain.iterrows():
                 try:
-                    premium_candidates = []
-                    if pd.notna(row.get("close")) and row["close"] > 0:
-                        premium_candidates.append(float(row["close"]))
-                    if pd.notna(row.get("bid")) and row["bid"] > 0:
-                        premium_candidates.append(float(row["bid"]))
-                    if pd.notna(row.get("ask")) and row["ask"] > 0:
-                        premium_candidates.append(float(row["ask"]))
-                    if not premium_candidates:
-                        premium_candidates = [0.01]
-
-                    bs_result = {}
-                    for prem in premium_candidates[:2]:
-                        params = {
-                            "symbol": row["option_symbol"],
-                            "irate": 0.1,
-                            "type": row["type"],
-                            "spotprice": row.get("spot", 0),
-                            "strike": row.get("strike", 0),
-                            "premium": prem,
-                            "dtm": int(row.get("dtm", 0)),
-                            "vol": 0.3,
-                            "duedate": row.get("expiration"),
-                            "amount": LOT_SIZE,
-                        }
-                        bs = fetch_bs_oplab(params, log_box)
-                        if bs and bs.get("delta") is not None:
-                            bs_result = bs
-                            break
-
-                    if bs_result:
-                        df_chain.at[idx,"delta"] = float(bs_result.get("delta", np.nan))
-                        df_chain.at[idx,"iv"] = float(bs_result.get("volatility") or bs_result.get("vol") or np.nan)
+                    bs = fetch_bs_oplab_accurate(row["option_symbol"], log_box)
+                    if bs and "delta" in bs:
+                        df_chain.at[idx,"delta"] = float(bs.get("delta", np.nan))
+                        df_chain.at[idx,"iv"] = float(bs.get("volatility", np.nan))
                     else:
-                        # fallback delta estimate
+                        # fallback estimado
                         spot = float(row.get("spot") or 0)
                         strike = float(row.get("strike") or 0)
                         if spot > 0:
                             m = (spot - strike) / spot
-                            k = 5.0
-                            delta_est = 0.5 + 0.4*np.tanh(k*m)
+                            delta_est = 0.5 + 0.4 * np.tanh(5*m)
                             if row.get("type","").upper()=="PUT":
                                 delta_est = -abs(delta_est)
                             df_chain.at[idx,"delta"] = delta_est
-                            log_box.text(f"[{tk}] (fallback) {row['option_symbol']} Δ≈{delta_est:.2f}")
+                            log_box.text(f"[{tk}] (fallback) Δ≈{delta_est:.3f} em {row['option_symbol']}")
                         else:
-                            df_chain.at[idx,"delta"]=np.nan
+                            df_chain.at[idx,"delta"] = np.nan
                     time.sleep(0.02)
                 except Exception as e:
-                    log_box.text(f"[{tk}] erro BS {e}")
+                    log_box.text(f"[{tk}] Erro BS: {e}")
                     continue
 
-            # filtros
-            df_chain["dtm"]=pd.to_numeric(df_chain["dtm"],errors="coerce").fillna(0).astype(int)
-            df_chain["delta_abs"]=df_chain["delta"].abs()
-            df_chain=df_chain[(df_chain["dtm"]>=dtm_min)&(df_chain["dtm"]<=dtm_max)]
-            df_chain=df_chain[(df_chain["delta_abs"]>=delta_min)&(df_chain["delta_abs"]<=delta_max)]
+            # Aplicar filtros
+            df_chain["dtm"] = pd.to_numeric(df_chain["dtm"], errors="coerce").fillna(0).astype(int)
+            df_chain["delta_abs"] = df_chain["delta"].abs()
+            df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
+            df_chain = df_chain[(df_chain["delta_abs"] >= delta_min) & (df_chain["delta_abs"] <= delta_max)]
 
             if HAVE_YFINANCE:
                 df_chain["iv_rank"]=df_chain["iv"].apply(lambda v:compute_iv_rank(tk,v) if pd.notna(v) else None)
@@ -251,6 +250,7 @@ if processar:
 
             calls=df_chain[df_chain["type"]=="CALL"].sort_values(by="close",ascending=False).head(3)
             puts=df_chain[df_chain["type"]=="PUT"].sort_values(by="close",ascending=False).head(3)
+
             if not calls.empty:
                 calls["ticker"]=tk; all_calls.append(calls)
             if not puts.empty:
@@ -270,7 +270,8 @@ if processar:
                     "iv_rank":best_call.get("iv_rank",None)
                 })
             progress_bar.progress(i/total)
-        progress_text.markdown("✅ **Processamento concluído!**")
+
+        progress_text.markdown("✅ **Processamento concluído com dados reais da OPLAB!**")
         progress_bar.empty()
 
         if all_calls:
