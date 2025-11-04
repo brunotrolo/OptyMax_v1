@@ -1,18 +1,17 @@
 # app.py
 """
-OptyMax — MVP Final (Delta Precisão API OPLAB + Filtro DTM Corrigido + Tracking Tempo Real)
--------------------------------------------------------------------------------------------
-- Calcula Delta e outras gregas com base em dados reais da OPLAB
-- Usa endpoints:
-    1️⃣ /market/options/details/{symbol}
-    2️⃣ /market/options/bs
-- Mantém 2 etapas (Listagem + Processamento)
-- Tracking em tempo real com logs
+OptyMax — MVP Final
+Delta real (API OPLAB) + Filtro DTM + Filtro OTM + Tracking em tempo real
+-------------------------------------------------------------------------------
+Fluxo:
+1️⃣ Listar opções — com filtros DTM aplicados
+2️⃣ Gerar recomendações — usando dados reais da OPLAB (delta, vol, spot, etc.)
+-------------------------------------------------------------------------------
 """
 
 import os
 import time
-from datetime import datetime, date
+from datetime import datetime
 import pandas as pd
 import numpy as np
 import requests
@@ -33,7 +32,7 @@ except Exception:
     HAVE_YFINANCE = False
 
 st.set_page_config(page_title="OptyMax — MVP", layout="wide")
-st.title("📈 OptyMax — Venda Coberta e Strangle (Delta Real OPLAB + Tracking Tempo Real)")
+st.title("📈 OptyMax — Venda Coberta e Strangle (Delta Real + Filtro OTM + Tracking)")
 
 # ============================================================
 # FUNÇÕES AUXILIARES
@@ -53,13 +52,13 @@ def fetch_tickers_with_names():
                 if len(code) in (5, 6) and any(ch.isdigit() for ch in code):
                     tickers.append((code, name))
         if not tickers:
-            return [("PETR4", "Petrobras PN"), ("VALE3", "Vale ON"), ("ITUB4", "Itaú Unibanco PN")]
+            return [("PETR4","Petrobras PN"),("VALE3","Vale ON"),("ITUB4","Itaú Unibanco PN")]
         seen = {}
         for t, n in tickers:
             if t not in seen: seen[t] = n
         return list(seen.items())
     except Exception:
-        return [("PETR4", "Petrobras PN"), ("VALE3", "Vale ON"), ("ITUB4", "Itaú Unibanco PN")]
+        return [("PETR4","Petrobras PN"),("VALE3","Vale ON"),("ITUB4","Itaú Unibanco PN")]
 
 def fetch_options_chain_by_parent(parent: str, log_box):
     """Obtém lista de opções de um ativo base diretamente da API OPLAB"""
@@ -105,20 +104,20 @@ def fetch_option_details(symbol: str):
     return None
 
 def fetch_bs_oplab_accurate(symbol: str, log_box):
-    """Consulta Black-Scholes com dados reais da OPLAB"""
+    """Consulta modelo Black-Scholes com dados reais da OPLAB"""
     details = fetch_option_details(symbol)
     if not details:
         return {}
     try:
         params = {
             "symbol": details.get("symbol"),
-            "irate": 0.1,  # taxa de juros anual (10%)
+            "irate": 0.1,
             "type": details.get("category", "").upper(),
             "spotprice": float(details.get("spot_price", 0)),
             "strike": float(details.get("strike", 0)),
             "premium": float(details.get("close", 0) or details.get("bid", 0) or details.get("ask", 0) or 0.01),
             "dtm": int(details.get("days_to_maturity", 0)),
-            "vol": float(details.get("volatility", 0.25)),  # volatilidade real ou default
+            "vol": float(details.get("volatility", 0.25)),
             "duedate": details.get("due_date", ""),
             "amount": 100
         }
@@ -220,7 +219,7 @@ if processar:
                         df_chain.at[idx,"delta"] = float(bs.get("delta", np.nan))
                         df_chain.at[idx,"iv"] = float(bs.get("volatility", np.nan))
                     else:
-                        # fallback estimado
+                        # fallback
                         spot = float(row.get("spot") or 0)
                         strike = float(row.get("strike") or 0)
                         if spot > 0:
@@ -238,18 +237,28 @@ if processar:
                     continue
 
             # Aplicar filtros
-            df_chain["dtm"] = pd.to_numeric(df_chain["dtm"], errors="coerce").fillna(0).astype(int)
-            df_chain["delta_abs"] = df_chain["delta"].abs()
-            df_chain = df_chain[(df_chain["dtm"] >= dtm_min) & (df_chain["dtm"] <= dtm_max)]
-            df_chain = df_chain[(df_chain["delta_abs"] >= delta_min) & (df_chain["delta_abs"] <= delta_max)]
+            df_chain["dtm"]=pd.to_numeric(df_chain["dtm"],errors="coerce").fillna(0).astype(int)
+            df_chain["delta_abs"]=df_chain["delta"].abs()
+            df_chain=df_chain[(df_chain["dtm"]>=dtm_min)&(df_chain["dtm"]<=dtm_max)]
+            df_chain=df_chain[(df_chain["delta_abs"]>=delta_min)&(df_chain["delta_abs"]<=delta_max)]
+
+            # 🔹 Filtro OTM — apenas fora do dinheiro
+            df_chain["is_otm"] = np.where(
+                ((df_chain["type"] == "CALL") & (df_chain["strike"] > df_chain["spot"])) |
+                ((df_chain["type"] == "PUT") & (df_chain["strike"] < df_chain["spot"])),
+                True, False
+            )
+            df_chain = df_chain[df_chain["is_otm"]]
 
             if HAVE_YFINANCE:
                 df_chain["iv_rank"]=df_chain["iv"].apply(lambda v:compute_iv_rank(tk,v) if pd.notna(v) else None)
             else:
                 df_chain["iv_rank"]=None
 
-            calls=df_chain[df_chain["type"]=="CALL"].sort_values(by="close",ascending=False).head(3)
-            puts=df_chain[df_chain["type"]=="PUT"].sort_values(by="close",ascending=False).head(3)
+            calls=(df_chain[df_chain["type"]=="CALL"]
+                .sort_values(by=["strike"],ascending=True).head(3))
+            puts=(df_chain[df_chain["type"]=="PUT"]
+                .sort_values(by=["strike"],ascending=False).head(3))
 
             if not calls.empty:
                 calls["ticker"]=tk; all_calls.append(calls)
@@ -271,15 +280,15 @@ if processar:
                 })
             progress_bar.progress(i/total)
 
-        progress_text.markdown("✅ **Processamento concluído com dados reais da OPLAB!**")
+        progress_text.markdown("✅ **Processamento concluído com filtro OTM!**")
         progress_bar.empty()
 
         if all_calls:
-            st.subheader("📈 CALLs Selecionadas")
-            st.dataframe(pd.concat(all_calls)[["ticker","option_symbol","strike","dtm","close","delta","iv","iv_rank"]])
+            st.subheader("📈 CALLs OTM Selecionadas")
+            st.dataframe(pd.concat(all_calls)[["ticker","option_symbol","strike","spot","dtm","close","delta","iv","iv_rank"]])
         if all_puts:
-            st.subheader("📉 PUTs Selecionadas")
-            st.dataframe(pd.concat(all_puts)[["ticker","option_symbol","strike","dtm","close","delta","iv","iv_rank"]])
+            st.subheader("📉 PUTs OTM Selecionadas")
+            st.dataframe(pd.concat(all_puts)[["ticker","option_symbol","strike","spot","dtm","close","delta","iv","iv_rank"]])
         if all_strangles:
             st.subheader("🔁 Strangles Montados")
             dfs=pd.DataFrame(all_strangles).sort_values(by="tio",ascending=False)
